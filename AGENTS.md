@@ -21,12 +21,21 @@ the phase `complete`.
 
 ## Commands
 
-| Command           | Purpose                                                  |
-| ----------------- | -------------------------------------------------------- |
-| `make check`      | Required gate: format, tidy, lint, race tests, vuln scan |
-| `make fmt`        | Apply gofumpt, goimports, and dprint (Markdown)          |
-| `make test`       | Unit tests without the race detector                     |
-| `make fuzz-smoke` | Each fuzz target for `FUZZTIME` (default 10s)            |
+| Command           | Purpose                                                              |
+| ----------------- | -------------------------------------------------------------------- |
+| `make check`      | Required gate: format, tidy, lint, race tests, vuln scan             |
+| `make fmt`        | Apply gofumpt, goimports, and dprint (Markdown)                      |
+| `make test`       | Unit tests without the race detector                                 |
+| `make fuzz-smoke` | Each fuzz target for `FUZZTIME` (default 10s)                        |
+| `make haproxy`    | Build pinned stock HAProxy 3.4.6 and 3.2.25 into `artifacts/haproxy` |
+| `make lab-smoke`  | Create the two-node lab, check 10/20 counts, tear it down            |
+| `make lab`        | Run the two-node lab until Ctrl-C                                    |
+| `make lab-test`   | Lab integration tests against each pinned build                      |
+
+Lab targets take any stock binary via `HAPROXY_BIN=/path/to/haproxy`; lab
+tests read `HTA_HAPROXY` (absolute path) and skip without it, so `make check`
+needs no HAProxy. `make haproxy` needs curl, cmake, make, gcc/g++, perl, and
+the Lua 5.4, PCRE2, and libcrypt dev packages (see `scripts/build-haproxy.sh`).
 
 Run `make check` before marking any phase acceptance item complete. Fix lint
 findings rather than suppressing them; a `//nolint` needs a specific linter

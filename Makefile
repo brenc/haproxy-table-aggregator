@@ -11,8 +11,14 @@ DPRINT = node_modules/.bin/dprint
 # Per-target budget for the bounded fuzz smoke; long fuzzing is manual.
 FUZZTIME ?= 10s
 
+# Local lab (docs/plans/01-local-lab.md). HAPROXY_BIN may be any stock
+# haproxy; the default is the pinned build from `make haproxy`.
+HAPROXY_VERSIONS ?= 3.4.6 3.2.25
+HAPROXY_BIN ?= artifacts/haproxy/3.4.6/haproxy
+LAB_RECORD_DIR = $(CURDIR)/artifacts/lab-runs
+
 .PHONY: check fmt fmt-check lint test test-race fuzz-smoke vuln tidy-check \
-	tools-update
+	tools-update haproxy lab lab-smoke lab-test
 
 check: fmt-check tidy-check lint test-race vuln
 
@@ -64,3 +70,28 @@ tools-update:
 		github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 	cd tools && $(GO) get -tool -modfile=govulncheck.mod \
 		golang.org/x/vuln/cmd/govulncheck@latest
+
+# Builds the pinned stock HAProxy releases into artifacts/haproxy.
+haproxy:
+	scripts/build-haproxy.sh $(HAPROXY_VERSIONS)
+
+# Starts the two-node lab and tears it down on Ctrl-C.
+lab:
+	$(GO) run ./cmd/htalab -haproxy $(abspath $(HAPROXY_BIN)) \
+		-record-dir $(LAB_RECORD_DIR)
+
+# Creates the lab, sends 10 requests to node a and 20 to node b, checks the
+# counts, and tears it down.
+lab-smoke:
+	$(GO) run ./cmd/htalab -haproxy $(abspath $(HAPROXY_BIN)) -smoke \
+		-record-dir $(LAB_RECORD_DIR)
+
+# Runs the lab integration tests (race detector on) against each pinned
+# build, recording each run's Go/HAProxy identity in artifacts/lab-runs.
+lab-test:
+	@set -e; for v in $(HAPROXY_VERSIONS); do \
+		echo "lab-test haproxy $$v"; \
+		HTA_HAPROXY=$(CURDIR)/artifacts/haproxy/$$v/haproxy \
+		HTA_HAPROXY_VERSION=$$v HTA_LAB_RECORD_DIR=$(LAB_RECORD_DIR) \
+		$(GO) test -race -count=1 -v ./internal/lab/...; \
+	done
