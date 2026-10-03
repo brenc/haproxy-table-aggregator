@@ -164,8 +164,8 @@ gate using a patched build. Later integration phases reuse this harness.
     native IPv4 address. `::1` keys as `::ffff:0.0.0.1`, so the loopback
     production test cannot show /64 masking of a native IPv6 source; the
     PROXY-protocol listener does, through the real `src` fetch, and also
-    shows the 6to4 behavior. The tests assert this behavior; whether it is
-    acceptable for production keying is an owner decision.
+    shows the 6to4 behavior. The tests assert this behavior; the owner
+    accepted it for production keying (see below).
 - Review: independent review of the full change found two medium defects
   (cleanup test could not detect a no-op `Close`; production `src` masking
   never saw a native IPv6 source) and one low (socket path limit two bytes
@@ -175,8 +175,14 @@ gate using a patched build. Later integration phases reuse this harness.
   reproduced both binary digests exactly (3.4.6 `81df335a…d1c4`, 3.2.25
   `5f89a725…8869`). It reused the existing AWS-LC install, so it covers the
   HAProxy step, not a from-scratch AWS-LC build.
-- Owner decision pending (does not block this phase): whether 6to4 and
-  IPv4-compatible sources sharing a key with the embedded IPv4 address is
-  acceptable for production keying with `src,ipmask(32,64)`.
+- Owner decision (2026-10-03): accept `ipmask`'s v6tov4 conversion for
+  production keying with `src,ipmask(32,64)`. A 6to4 /48 belongs to the
+  holder of its embedded IPv4 address, so one key per that address is the
+  correct client identity; keying per /64 instead would let one 6to4 client
+  rotate through 65,536 buckets. Spoofing another address's 6to4 key needs
+  a completed TCP handshake whose replies route to the real IPv4 holder,
+  and 6to4 traffic is rare. IPv4-mapped and IPv4-compatible sources fold
+  the same way. `TestProxyProtocolMasking` pins this behavior, so an
+  upstream change fails the lab tests.
 - Remaining work / next action: start phase 02. Later phases reuse
   `internal/lab` and `internal/lab/labtest`.
