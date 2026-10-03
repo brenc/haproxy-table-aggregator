@@ -3,7 +3,7 @@
 ## Implementation checklist
 
 - [x] [00 — Development tooling](00-dev-tooling.md)
-- [ ] [01 — Reproducible local lab](01-local-lab.md)
+- [x] [01 — Reproducible local lab](01-local-lab.md)
 - [ ] [02 — Wire framing and integers](02-wire-framing.md)
 - [ ] [03 — Table and entry messages](03-table-messages.md)
 - [ ] [04 — Peer sessions](04-peer-sessions.md)
