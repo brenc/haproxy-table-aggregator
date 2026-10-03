@@ -9,7 +9,10 @@ GOVULNCHECK = $(GO) tool -modfile=tools/govulncheck.mod govulncheck
 DPRINT = node_modules/.bin/dprint
 
 # Per-target budget for the bounded fuzz smoke; long fuzzing is manual.
+# FUZZMINIMIZETIME caps how long each newly interesting input is minimized,
+# so large seeds cannot consume the smoke budget without fuzzing.
 FUZZTIME ?= 10s
+FUZZMINIMIZETIME ?= 1s
 
 # Local lab (docs/plans/01-local-lab.md). HAPROXY_BIN may be any stock
 # haproxy; the default is the pinned build from `make haproxy`.
@@ -18,7 +21,7 @@ HAPROXY_BIN ?= artifacts/haproxy/3.4.6/haproxy
 LAB_RECORD_DIR = $(CURDIR)/artifacts/lab-runs
 
 .PHONY: check fmt fmt-check lint test test-race fuzz-smoke vuln tidy-check \
-	tools-update haproxy lab lab-smoke lab-test
+	tools-update haproxy lab lab-smoke lab-test peerwire-captures
 
 check: fmt-check tidy-check lint test-race vuln
 
@@ -50,7 +53,8 @@ fuzz-smoke:
 		list=$$($(GO) test -list '^Fuzz' $$pkg) || exit 1; \
 		for fn in $$(echo "$$list" | grep '^Fuzz' || true); do \
 			echo "fuzz $$pkg $$fn"; \
-			$(GO) test -run='^$$' -fuzz="^$$fn$$" -fuzztime=$(FUZZTIME) $$pkg; \
+			$(GO) test -run='^$$' -fuzz="^$$fn$$" -fuzztime=$(FUZZTIME) \
+				-fuzzminimizetime=$(FUZZMINIMIZETIME) $$pkg; \
 		done; \
 	done
 
@@ -88,10 +92,23 @@ lab-smoke:
 
 # Runs the lab integration tests (race detector on) against each pinned
 # build, recording each run's Go/HAProxy identity in artifacts/lab-runs.
+# This includes the live peers-protocol captures in internal/peerwire.
 lab-test:
 	@set -e; for v in $(HAPROXY_VERSIONS); do \
 		echo "lab-test haproxy $$v"; \
 		HTA_HAPROXY=$(CURDIR)/artifacts/haproxy/$$v/haproxy \
 		HTA_HAPROXY_VERSION=$$v HTA_LAB_RECORD_DIR=$(LAB_RECORD_DIR) \
-		$(GO) test -race -count=1 -v ./internal/lab/...; \
+		$(GO) test -race -count=1 -v ./internal/...; \
+	done
+
+# Regenerates the committed peers-protocol capture fixtures from each
+# pinned build. Review the diff: it should change only PIDs, ports,
+# timestamps, and time-dependent counter fields.
+peerwire-captures:
+	@set -e; for v in $(HAPROXY_VERSIONS); do \
+		echo "peerwire-captures haproxy $$v"; \
+		HTA_HAPROXY=$(CURDIR)/artifacts/haproxy/$$v/haproxy \
+		HTA_HAPROXY_VERSION=$$v HTA_LAB_RECORD_DIR=$(LAB_RECORD_DIR) \
+		HTA_PEERWIRE_CAPTURE_DIR=$(CURDIR)/internal/peerwire/testdata/captures \
+		$(GO) test -count=1 -run '^TestLiveCapture$$' -v ./internal/peerwire; \
 	done

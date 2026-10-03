@@ -1,0 +1,496 @@
+package peerwire_test
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/brenc/haproxy-table-aggregator/internal/peerwire"
+)
+
+// Capture fixtures record one TCP connection between stock HAProxy and a
+// test peer. They are written only by TestLiveCapture (see
+// capture_live_test.go) and are never edited by hand. Format, one item per
+// line:
+//
+//	# comment                 ignored
+//	@key value                metadata
+//	rx <hex>                  bytes received from HAProxy, in order
+//	tx <hex>                  bytes sent to HAProxy, in order
+//	txz <n>                   n zero bytes sent to HAProxy
+//	note <text>               an action taken at this point (runtime
+//	                          command, read deadline, ...)
+//
+// The rx and tx streams are the concatenation of their lines.
+const (
+	captureFormat = "peerwire-capture/1"
+	captureDir    = "testdata/captures"
+	hexPerLine    = 32
+	zeroRunMin    = 64
+	maxZeroRun    = 1 << 20
+)
+
+// Versions with committed fixtures. Each must have every case.
+var captureVersions = []string{"3.4.6", "3.2.25"}
+
+type captureItem struct {
+	kind string // "rx", "tx", or "note"
+	data []byte
+	text string
+}
+
+type capture struct {
+	meta  [][2]string
+	items []captureItem
+}
+
+func (c *capture) set(key, value string) {
+	for i := range c.meta {
+		if c.meta[i][0] == key {
+			c.meta[i][1] = value
+			return
+		}
+	}
+	c.meta = append(c.meta, [2]string{key, value})
+}
+
+func (c *capture) get(key string) string {
+	for _, kv := range c.meta {
+		if kv[0] == key {
+			return kv[1]
+		}
+	}
+	return ""
+}
+
+func (c *capture) add(kind string, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	c.items = append(c.items, captureItem{kind: kind, data: bytes.Clone(data)})
+}
+
+func (c *capture) note(format string, args ...any) {
+	c.items = append(c.items, captureItem{kind: "note", text: fmt.Sprintf(format, args...)})
+}
+
+func (c *capture) stream(kind string) []byte {
+	var b []byte
+	for _, it := range c.items {
+		if it.kind == kind {
+			b = append(b, it.data...)
+		}
+	}
+	return b
+}
+
+// trimRx drops received bytes past n, which a reader may have buffered
+// beyond the last complete frame before closing.
+func (c *capture) trimRx(n int) int {
+	total := len(c.stream("rx"))
+	excess := total - n
+	dropped := excess
+	for i := len(c.items) - 1; i >= 0 && excess > 0; i-- {
+		if c.items[i].kind != "rx" {
+			continue
+		}
+		k := min(excess, len(c.items[i].data))
+		c.items[i].data = c.items[i].data[:len(c.items[i].data)-k]
+		excess -= k
+	}
+	c.items = slices.DeleteFunc(c.items, func(it captureItem) bool { return it.kind != "note" && len(it.data) == 0 })
+	return max(dropped, 0)
+}
+
+func (c *capture) encode(comments []string) []byte {
+	var b bytes.Buffer
+	for _, line := range comments {
+		b.WriteString(strings.TrimRight("# "+line, " ") + "\n")
+	}
+	for _, kv := range c.meta {
+		fmt.Fprintf(&b, "@%s %s\n", kv[0], kv[1])
+	}
+	for _, it := range c.items {
+		if it.kind == "note" {
+			fmt.Fprintf(&b, "note %s\n", it.text)
+			continue
+		}
+		data := it.data
+		for len(data) > 0 {
+			if it.kind == "tx" {
+				z := 0
+				for z < len(data) && data[z] == 0 {
+					z++
+				}
+				if z >= zeroRunMin {
+					fmt.Fprintf(&b, "txz %d\n", z)
+					data = data[z:]
+					continue
+				}
+			}
+			n := min(len(data), hexPerLine)
+			if it.kind == "tx" {
+				if i := bytes.Index(data[:n], make([]byte, zeroRunMin)); i > 0 {
+					n = i
+				}
+			}
+			fmt.Fprintf(&b, "%s %s\n", it.kind, hex.EncodeToString(data[:n]))
+			data = data[n:]
+		}
+	}
+	return b.Bytes()
+}
+
+func parseCapture(r io.Reader) (*capture, error) {
+	c := &capture{}
+	sc := bufio.NewScanner(r)
+	for n := 1; sc.Scan(); n++ {
+		line := sc.Text()
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		kind, rest, _ := strings.Cut(line, " ")
+		switch {
+		case strings.HasPrefix(kind, "@"):
+			c.meta = append(c.meta, [2]string{kind[1:], rest})
+		case kind == "rx" || kind == "tx":
+			b, err := hex.DecodeString(rest)
+			if err != nil || len(b) == 0 {
+				return nil, fmt.Errorf("line %d: bad hex", n)
+			}
+			c.items = append(c.items, captureItem{kind: kind, data: b})
+		case kind == "txz":
+			z, err := strconv.Atoi(rest)
+			if err != nil || z <= 0 || z > maxZeroRun {
+				return nil, fmt.Errorf("line %d: bad zero run %q", n, rest)
+			}
+			c.items = append(c.items, captureItem{kind: "tx", data: make([]byte, z)})
+		case kind == "note":
+			c.items = append(c.items, captureItem{kind: "note", text: rest})
+		default:
+			return nil, fmt.Errorf("line %d: unknown item %q", n, kind)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if got := c.get("format"); got != captureFormat {
+		return nil, fmt.Errorf("format %q, want %q", got, captureFormat)
+	}
+	return c, nil
+}
+
+// Boundary values the live capture stores through the runtime API, keyed
+// by integer stick-table key (index + 1). Expected bytes come from
+// specEncodings, never from this package's encoder.
+var (
+	boundaryU32 = boundaryValues(func(v uint64) bool { return v <= math.MaxUint32 })
+	boundaryU64 = boundaryValues(func(v uint64) bool { return v > math.MaxUint32 })
+)
+
+func boundaryValues(keep func(uint64) bool) []uint64 {
+	var out []uint64
+	for _, e := range specEncodings {
+		if keep(e.v) {
+			out = append(out, e.v)
+		}
+	}
+	return out
+}
+
+func specHex(tb testing.TB, v uint64) []byte {
+	tb.Helper()
+	for _, e := range specEncodings {
+		if e.v == v {
+			return mustHex(tb, e.hex)
+		}
+	}
+	tb.Fatalf("%#x is not in specEncodings", v)
+	return nil
+}
+
+// Table names used by the capture configuration and fixture checks.
+const (
+	tableReq = "t_req"
+	tableU32 = "t_u32"
+	tableU64 = "t_u64"
+)
+
+// captureCase says how to frame and check one fixture.
+type captureCase struct {
+	// rxLines and txLines are the handshake lines that open each stream.
+	rxLines, txLines int
+	// status is the status line expected in whichever stream carries it.
+	status peerwire.StatusCode
+	// rxTail is the class/type pair of the last frame HAProxy sent, if it
+	// ended the session with an error message. Otherwise HAProxy must
+	// have sent no error message at all.
+	rxTail []byte
+	// txErr is what this package's decoder must report on the test
+	// peer's stream: io.EOF if it is well-formed.
+	txErr error
+}
+
+var captureCases = map[string]captureCase{
+	"initiator":          {rxLines: 3, txLines: 1, status: peerwire.StatusSucceeded, txErr: io.EOF},
+	"acceptor":           {rxLines: 1, txLines: 3, status: peerwire.StatusSucceeded, txErr: io.EOF},
+	"status-501":         {rxLines: 1, txLines: 3, status: peerwire.StatusProtocolError, txErr: io.EOF},
+	"status-502":         {rxLines: 1, txLines: 3, status: peerwire.StatusBadVersion, txErr: io.EOF},
+	"status-503":         {rxLines: 1, txLines: 3, status: peerwire.StatusHostMismatch, txErr: io.EOF},
+	"status-504":         {rxLines: 1, txLines: 3, status: peerwire.StatusUnknownPeer, txErr: io.EOF},
+	"frame-at-bufsize":   {rxLines: 1, txLines: 3, status: peerwire.StatusSucceeded, rxTail: []byte{1, 0}, txErr: peerwire.ErrReservedClass},
+	"frame-over-bufsize": {rxLines: 1, txLines: 3, status: peerwire.StatusSucceeded, txErr: peerwire.ErrReservedClass},
+	"size-limit":         {rxLines: 1, txLines: 3, status: peerwire.StatusSucceeded, rxTail: []byte{1, 1}, txErr: peerwire.ErrMessageTooLarge},
+	"unknown-messages":   {rxLines: 1, txLines: 3, status: peerwire.StatusSucceeded, rxTail: []byte{1, 0}, txErr: peerwire.ErrReservedClass},
+	"reserved-class":     {rxLines: 1, txLines: 3, status: peerwire.StatusSucceeded, rxTail: []byte{1, 0}, txErr: peerwire.ErrReservedClass},
+	"length-encoding":    {rxLines: 1, txLines: 3, status: peerwire.StatusSucceeded, rxTail: []byte{1, 0}, txErr: peerwire.ErrLengthEncoding},
+}
+
+func TestCaptureFixtures(t *testing.T) {
+	for _, v := range captureVersions {
+		for name := range captureCases {
+			t.Run(v+"/"+name, func(t *testing.T) {
+				f, err := os.Open(filepath.Join(captureDir, v, name+".txt"))
+				if err != nil {
+					t.Fatalf("fixture missing; regenerate with `make peerwire-captures`: %v", err)
+				}
+				defer func() { _ = f.Close() }()
+				c, err := parseCapture(f)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := c.get("haproxy-version"); !strings.HasPrefix(got, v+"-") && got != v {
+					t.Fatalf("fixture records haproxy %q", got)
+				}
+				verifyCapture(t, c)
+			})
+		}
+	}
+}
+
+// verifyCapture frames both streams of c under every chunking and checks
+// the case's expectations. It is shared by fixture replay and live runs.
+func verifyCapture(t *testing.T, c *capture) {
+	t.Helper()
+	name := c.get("case")
+	cc, ok := captureCases[name]
+	if !ok {
+		t.Fatalf("unknown case %q", name)
+	}
+	rx := frameEverySplit(t, "rx", c.stream("rx"), cc.rxLines)
+	tx := frameEverySplit(t, "tx", c.stream("tx"), cc.txLines)
+	if !errors.Is(rx.err, io.EOF) {
+		t.Fatalf("rx stream: %v, want a clean end", rx.err)
+	}
+	if !errors.Is(tx.err, cc.txErr) {
+		t.Fatalf("tx stream: %v, want %v", tx.err, cc.txErr)
+	}
+
+	statusStream, statusAt := rx, cc.rxLines-1
+	if cc.rxLines == 3 {
+		statusStream, statusAt = tx, 0
+	}
+	got, err := peerwire.ParseStatusLine(statusStream.events[statusAt].data)
+	if err != nil || got != cc.status {
+		t.Fatalf("status line %q: %d, %v; want %d", statusStream.events[statusAt].data, got, err, cc.status)
+	}
+	if cc.txLines == 3 && cc.status == peerwire.StatusSucceeded {
+		checkHello(t, tx.events, "hap", "agg", 0)
+	}
+	if cc.rxLines == 3 {
+		pid, err := strconv.ParseUint(c.get("haproxy-pid"), 10, 32)
+		if err != nil {
+			t.Fatalf("haproxy-pid: %v", err)
+		}
+		checkHello(t, rx.events, "agg", "hap", uint32(pid))
+	}
+
+	frames := rx.events[cc.rxLines:]
+	if cc.status != peerwire.StatusSucceeded && len(frames) != 0 {
+		t.Fatalf("HAProxy sent %d frames after status %d", len(frames), cc.status)
+	}
+	before := frames
+	if cc.rxTail != nil {
+		if len(frames) == 0 || !bytes.Equal(frames[len(frames)-1].data, cc.rxTail) {
+			t.Fatalf("last rx frame is not %x: %v", cc.rxTail, frames)
+		}
+		before = frames[:len(frames)-1]
+	}
+	if hasClass(before, peerwire.ClassError) {
+		t.Fatalf("unexpected error message from HAProxy: %v", before)
+	}
+	switch name {
+	case "initiator":
+		checkInitiatorFrames(t, frames)
+	case "acceptor":
+		if len(frames) == 0 || frames[0].start != statusStream.events[0].end {
+			t.Fatalf("no binary message directly after the status line")
+		}
+		if !hasFrame(frames, peerwire.ClassControl, peerwire.ControlHeartbeat) {
+			t.Errorf("no heartbeat")
+		}
+		checkBoundaryUpdates(t, frames)
+	case "frame-at-bufsize", "frame-over-bufsize":
+		// HAProxy's default tune.bufsize. A message is processed only
+		// once all of it fits in that buffer: the protocol error in
+		// frame-at-bufsize proves the preceding 16384-byte message was
+		// consumed, while one byte more stalls the session until HAProxy
+		// times it out, without an error message.
+		const bufsize = 16384
+		want := bufsize
+		if name == "frame-over-bufsize" {
+			want++
+		}
+		if !slices.ContainsFunc(tx.events[cc.txLines:], func(e event) bool { return len(e.data) == want }) {
+			t.Fatalf("tx stream has no %d-byte message", want)
+		}
+	}
+}
+
+// frameEverySplit frames a stream whole, byte by byte, and split in two at
+// every offset, and requires identical results that preserve every byte.
+func frameEverySplit(t *testing.T, label string, input []byte, lines int) outcome {
+	t.Helper()
+	lim := peerwire.DefaultLimits()
+	var want outcome
+	for i, chunks := range splits(input) {
+		got, err := decodeChunks(lim, chunks, lines)
+		if err != nil {
+			t.Fatalf("%s: %d chunks: %v", label, len(chunks), err)
+		}
+		if i == 0 {
+			want = got
+			if err := checkPreserved(input, want); err != nil {
+				t.Fatalf("%s: %v", label, err)
+			}
+			if len(want.events) < lines {
+				t.Fatalf("%s: %d handshake lines, want %d (%v)", label, len(want.events), lines, want.err)
+			}
+			continue
+		}
+		if !got.equal(want) {
+			t.Fatalf("%s: %d chunks (first %d bytes) differ: %v / %v vs %v / %v",
+				label, len(chunks), len(chunks[0]), got.events, got.err, want.events, want.err)
+		}
+	}
+	return want
+}
+
+func checkHello(t *testing.T, events []event, remote, local string, pid uint32) {
+	t.Helper()
+	h, err := peerwire.ParseHello(events[0].data, events[1].data, events[2].data)
+	if err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	if h.Version != peerwire.ProtocolVersion || h.RemotePeer != remote || h.LocalPeer != local || h.RelativePID != 1 ||
+		(pid != 0 && h.PID != pid) {
+		t.Fatalf("hello %+v, want version %v, %s -> %s, pid %d, relative 1", h, peerwire.ProtocolVersion, local, remote, pid)
+	}
+}
+
+func hasClass(frames []event, class peerwire.MessageClass) bool {
+	return slices.ContainsFunc(frames, func(e event) bool { return e.class == class })
+}
+
+func hasFrame(frames []event, class peerwire.MessageClass, typ peerwire.MessageType) bool {
+	return slices.ContainsFunc(frames, func(e event) bool { return e.class == class && e.typ == typ })
+}
+
+// checkInitiatorFrames checks the binary part of the initiator capture:
+// the control exchange and the boundary updates.
+func checkInitiatorFrames(t *testing.T, frames []event) {
+	t.Helper()
+	for _, want := range []peerwire.MessageType{peerwire.ControlResyncRequest, peerwire.ControlResyncConfirm, peerwire.ControlHeartbeat} {
+		if !hasFrame(frames, peerwire.ClassControl, want) {
+			t.Errorf("no control message %d", want)
+		}
+	}
+	checkBoundaryUpdates(t, frames)
+}
+
+// checkBoundaryUpdates checks that every capture table is defined and
+// that HAProxy's own encoding of every boundary value matches
+// specEncodings. Locating the
+// value inside an update relies on the capture's fixed schema (integer
+// key, one data type), not on a general entry decoder: an update body is
+// [4-byte update ID if 0x80/0x85][4-byte expiry if 0x85/0x86][4-byte key]
+// [encoded value]. The key bytes are checked too, so a misread layout
+// fails rather than passes.
+func checkBoundaryUpdates(t *testing.T, frames []event) {
+	t.Helper()
+	defined := map[string]bool{}
+	seen := map[string]map[uint32]bool{tableU32: {}, tableU64: {}}
+	values := map[string][]uint64{tableU32: boundaryU32, tableU64: boundaryU64}
+	var table string
+	for _, f := range frames {
+		if f.class != peerwire.ClassStickTable {
+			continue
+		}
+		c := peerwire.NewCursor(f.body)
+		switch f.typ {
+		case peerwire.StickTableDefine:
+			if _, err := c.Uint32(); err != nil {
+				t.Fatalf("definition %v: table ID: %v", f, err)
+			}
+			n, err := c.Uint()
+			if err != nil {
+				t.Fatalf("definition %v: name length: %v", f, err)
+			}
+			name, err := c.Bytes(n)
+			if err != nil {
+				t.Fatalf("definition %v: name: %v", f, err)
+			}
+			table = string(name)
+			defined[table] = true
+		case peerwire.StickTableUpdate, peerwire.StickTableIncrementalUpdate,
+			peerwire.StickTableTimedUpdate, peerwire.StickTableIncrementalTimedUpdate:
+			vals, ok := values[table]
+			if !ok {
+				continue
+			}
+			if f.typ == peerwire.StickTableUpdate || f.typ == peerwire.StickTableTimedUpdate {
+				if _, err := c.Fixed32(); err != nil {
+					t.Fatalf("%v: update ID: %v", f, err)
+				}
+			}
+			if f.typ == peerwire.StickTableTimedUpdate || f.typ == peerwire.StickTableIncrementalTimedUpdate {
+				if _, err := c.Fixed32(); err != nil {
+					t.Fatalf("%v: expiry: %v", f, err)
+				}
+			}
+			key, err := c.Fixed32()
+			if err != nil || key == 0 || int(key) > len(vals) {
+				t.Fatalf("%s update %v: key %d, %v", table, f, key, err)
+			}
+			want := vals[key-1]
+			raw := c.Rest()
+			got, n, err := peerwire.DecodeUint(raw)
+			if err != nil || n != len(raw) || got != want || !bytes.Equal(raw, specHex(t, want)) {
+				t.Fatalf("%s key %d: HAProxy sent %x (%#x, %d/%d bytes, %v); spec encoding of %#x is %x",
+					table, key, raw, got, n, len(raw), err, want, specHex(t, want))
+			}
+			seen[table][key] = true
+		default:
+		}
+	}
+	for _, name := range []string{tableReq, tableU32, tableU64} {
+		if !defined[name] {
+			t.Errorf("no definition for %s", name)
+		}
+	}
+	for table, keys := range seen {
+		if len(keys) != len(values[table]) {
+			t.Errorf("%s: saw %d of %d boundary keys", table, len(keys), len(values[table]))
+		}
+	}
+}
