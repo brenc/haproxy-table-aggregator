@@ -171,6 +171,10 @@ gate using a patched build. Later integration phases reuse this harness.
   never saw a native IPv6 source) and one low (socket path limit two bytes
   loose). All three were fixed in one batch and confirmed by the reviewer
   with mutants. `GOOS=darwin` and `GOOS=freebsd` `go vet ./...` pass.
+- Rebuild check (2026-10-03): `make haproxy` rerun in place after review
+  reproduced both binary digests exactly (3.4.6 `81df335a…d1c4`, 3.2.25
+  `5f89a725…8869`). It reused the existing AWS-LC install, so it covers the
+  HAProxy step, not a from-scratch AWS-LC build.
 - Owner decision pending (does not block this phase): whether 6to4 and
   IPv4-compatible sources sharing a key with the embedded IPv4 address is
   acceptable for production keying with `src,ipmask(32,64)`.
