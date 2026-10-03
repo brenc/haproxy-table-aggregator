@@ -298,3 +298,43 @@ func running(pid int, binary string) bool {
 	exe, err := os.Readlink(proc + "/exe")
 	return err == nil && strings.TrimSuffix(exe, " (deleted)") == binary
 }
+
+// TestCustomCloseStops checks that a custom-config node binds its
+// inherited listeners and that Close stops it and releases them, as for
+// the two-node lab.
+func TestCustomCloseStops(t *testing.T) {
+	c, err := lab.StartCustom(t.Context(), lab.CustomOptions{
+		HAProxy:   labtest.HAProxy(t),
+		Listeners: 2,
+		Config: func(p lab.CustomParams) ([]byte, error) {
+			return []byte("global\n    stats socket " + p.Socket + " mode 600 level admin\n" +
+				"defaults\n    mode http\n    timeout client 1s\n" +
+				"frontend one\n    bind " + p.Binds[0] + "\n    http-request return status 200\n" +
+				"frontend two\n    bind " + p.Binds[1] + "\n    http-request return status 200\n"), nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := childState{
+		Dir: c.Dir, HAProxy: c.Record.HAProxyPath, PIDs: []int{c.Node.PID()},
+		Addrs: c.Node.Addrs(), Sockets: []string{c.Node.Socket},
+	}
+	if live := leftovers(st); len(st.Addrs) != 2 || len(live) != 1+len(st.Addrs)+len(st.Sockets) {
+		_ = c.Close()
+		t.Fatalf("custom node not fully up before Close: %+v, live %v", st, live)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if left := leftovers(st); len(left) > 0 {
+		killLeft(st)
+		t.Fatalf("resources alive after Close returned: %v", left)
+	}
+	if _, err := os.Stat(st.Dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("dir %s still exists after Close: %v", st.Dir, err)
+	}
+	if err := c.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
+}

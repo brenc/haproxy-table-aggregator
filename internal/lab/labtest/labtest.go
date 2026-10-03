@@ -57,7 +57,34 @@ func Start(tb testing.TB, opts lab.Options) *lab.Lab {
 			tb.Errorf("close lab: %v", err)
 		}
 	})
-	rec := l.Record
+	checkRecord(tb, l.Record)
+	return l
+}
+
+// StartCustom starts a single HAProxy process with a caller-supplied
+// configuration (filling HAProxy from the environment when empty),
+// registers its teardown with tb.Cleanup, and applies the same version
+// check and run record as Start.
+func StartCustom(tb testing.TB, opts lab.CustomOptions) *lab.Custom {
+	tb.Helper()
+	if opts.HAProxy == "" {
+		opts.HAProxy = HAProxy(tb)
+	}
+	c, err := lab.StartCustom(context.Background(), opts)
+	if err != nil {
+		tb.Fatalf("start custom haproxy: %v", err)
+	}
+	tb.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			tb.Errorf("close custom haproxy: %v", err)
+		}
+	})
+	checkRecord(tb, c.Record)
+	return c
+}
+
+func checkRecord(tb testing.TB, rec lab.RunRecord) {
+	tb.Helper()
 	tb.Logf("lab run: %s", rec.Summary())
 	if want := os.Getenv(EnvHAProxyVersion); want != "" &&
 		rec.HAProxyVersion != want && !strings.HasPrefix(rec.HAProxyVersion, want+"-") {
@@ -73,5 +100,4 @@ func Start(tb testing.TB, opts lab.Options) *lab.Lab {
 		}
 		tb.Logf("run record: %s", path)
 	}
-	return l
 }

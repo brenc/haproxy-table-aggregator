@@ -90,6 +90,10 @@ type Node struct {
 	// ProdAddr6 is the production-style listener on [::1], or empty when
 	// IPv6 loopback is unavailable on this host.
 	ProdAddr6 string
+	// Listeners are the listener addresses of a custom node (see
+	// StartCustom), in CustomOptions order. The lab listener fields above
+	// are empty for a custom node.
+	Listeners []string
 	// Socket is the admin-level runtime API socket.
 	Socket string
 	// ConfigPath is the generated configuration file.
@@ -290,25 +294,38 @@ func (l *Lab) startNode(ctx context.Context, haproxy, name string) (*Node, error
 	if err != nil {
 		return nil, err
 	}
-	if err = os.WriteFile(n.ConfigPath, cfg, 0o600); err != nil {
-		return nil, fmt.Errorf("lab: %w", err)
+	if err := n.spawn(ctx, haproxy, l.Dir, cfg, files); err != nil {
+		if n.cmd == nil {
+			return nil, fmt.Errorf("lab: node %s: %w", name, err)
+		}
+		return n, fmt.Errorf("lab: node %s: %w", name, err)
+	}
+	return n, nil
+}
+
+// spawn writes cfg to n.ConfigPath, starts haproxy in the foreground with
+// files as inherited descriptors 3, 4, ..., and waits until it answers on
+// n.Socket. If the process started, n owns it even when spawn fails.
+func (n *Node) spawn(ctx context.Context, haproxy, dir string, cfg []byte, files []*os.File) error {
+	if err := os.WriteFile(n.ConfigPath, cfg, 0o600); err != nil {
+		return err
 	}
 	logFile, err := os.OpenFile(n.LogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("lab: %w", err)
+		return err
 	}
 	defer func() { _ = logFile.Close() }()
 
 	//nolint:noctx,gosec // G204: running the operator-chosen haproxy is the
 	// point; its lifetime is owned by Close rather than a context.
 	cmd := exec.Command(haproxy, "-db", "-f", n.ConfigPath)
-	cmd.Dir = l.Dir
+	cmd.Dir = dir
 	cmd.Env = []string{}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.ExtraFiles = files
 	if err := startOwned(cmd); err != nil {
-		return nil, fmt.Errorf("lab: start node %s: %w", name, err)
+		return fmt.Errorf("start: %w", err)
 	}
 	n.cmd = cmd
 	n.exited = make(chan struct{})
@@ -318,9 +335,9 @@ func (l *Lab) startNode(ctx context.Context, haproxy, name string) (*Node, error
 	}()
 
 	if err := n.waitReady(ctx); err != nil {
-		return n, fmt.Errorf("lab: node %s: %w\n%s", name, err, n.logTail())
+		return fmt.Errorf("%w\n%s", err, n.logTail())
 	}
-	return n, nil
+	return nil
 }
 
 func (n *Node) waitReady(ctx context.Context) error {
@@ -389,11 +406,13 @@ func (n *Node) ShowTable(ctx context.Context, table string) (Table, error) {
 
 // Addrs returns every listener address the node owns.
 func (n *Node) Addrs() []string {
-	addrs := []string{n.LabAddr, n.ProdAddr4, n.ProxyAddr}
-	if n.ProdAddr6 != "" {
-		addrs = append(addrs, n.ProdAddr6)
+	var addrs []string
+	for _, a := range []string{n.LabAddr, n.ProdAddr4, n.ProxyAddr, n.ProdAddr6} {
+		if a != "" {
+			addrs = append(addrs, a)
+		}
 	}
-	return addrs
+	return append(addrs, n.Listeners...)
 }
 
 func (n *Node) stop() error {
