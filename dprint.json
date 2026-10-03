@@ -1,0 +1,7 @@
+{
+  "markdown": {},
+  "excludes": [],
+  "plugins": [
+    "npm:@dprint/markdown@0.25.0@ba3da36dae4d42c97b11b6af268b66e1deab3df209f2014685b6d80ce75b1c23"
+  ]
+}

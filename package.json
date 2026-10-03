@@ -1,0 +1,8 @@
+{
+  "name": "haproxy-table-aggregator-tooling",
+  "private": true,
+  "description": "Pinned non-Go developer tools; the service itself is pure Go.",
+  "devDependencies": {
+    "dprint": "0.59.0"
+  }
+}
