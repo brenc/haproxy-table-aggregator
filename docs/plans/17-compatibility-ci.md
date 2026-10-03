@@ -16,8 +16,8 @@ versions and makes regression results inspectable by outside contributors.
   path, plus a bounded multithreaded reload smoke.
 - Record supported combinations only when all required gates pass. Keep patched
   experiments in a separately labeled optional comparison outside support results.
-- Add CI for formatting, static checks, unit/race tests, bounded fuzz smoke, and
-  the practical upstream integration matrix. Heavy load tests may be an explicit
+- Add CI that runs phase 00's `make check` and `make fuzz-smoke` plus the
+  practical upstream integration matrix. Heavy load tests may be an explicit
   qualification job rather than every push.
 - Pin CI dependencies and artifact provenance using current documentation.
   Keep permissions minimal and avoid secrets for the public local/CI test route.

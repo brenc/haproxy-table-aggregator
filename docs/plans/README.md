@@ -2,6 +2,7 @@
 
 ## Implementation checklist
 
+- [x] [00 — Development tooling](00-dev-tooling.md)
 - [ ] [01 — Reproducible local lab](01-local-lab.md)
 - [ ] [02 — Wire framing and integers](02-wire-framing.md)
 - [ ] [03 — Table and entry messages](03-table-messages.md)
@@ -22,11 +23,12 @@
 - [ ] [18 — Load qualification](18-load-qualification.md)
 - [ ] [19 — Staging shadow preparation](19-staging-shadow.md)
 
-This checklist is a stable navigation index, not a live progress dashboard.
-**Update only the relevant phase file for planning and progress:** its status,
+This checklist is the at-a-glance progress tracker. Tick a phase's box in the
+same change that marks its phase file `complete`, and only then. **Record all
+other planning and progress in the relevant phase file:** its status,
 acceptance checkboxes, decisions, commands, results, and handoff. Do not append
-execution logs to this README or change its checklist during phase work.
-Each phase file is the authoritative record of that phase's completion.
+execution logs to this README. Each phase file is the authoritative record of
+that phase's completion; the checklist mirrors it.
 
 ## Purpose and current status
 
@@ -141,11 +143,11 @@ during degradation. All enforcement remains local to HAProxy.
 
 Starting acceptance targets, configurable and subject to demonstrated bounds:
 
-| Condition | Target |
-| --- | --- |
-| Healthy update propagation | p99 at most 250 ms under the declared benchmark |
-| Aggregate publication stops | Authority expires locally within 2 seconds |
-| Silent source/network failure | Local fallback within 10 seconds |
+| Condition                     | Target                                          |
+| ----------------------------- | ----------------------------------------------- |
+| Healthy update propagation    | p99 at most 250 ms under the declared benchmark |
+| Aggregate publication stops   | Authority expires locally within 2 seconds      |
+| Silent source/network failure | Local fallback within 10 seconds                |
 
 Freshness must cover data progress, not just a periodically updated marker.
 Phase 06 must prove that reload, resync replay, stalled delivery, or delayed
@@ -172,7 +174,7 @@ supported; a required contract change goes back to the owner.
 The public lab must accept an explicit HAProxy executable or reproducibly built
 pinned artifact and run without this Ansible repository, infrastructure access,
 Bitwarden, real client data, or proprietary fixtures. Linux is the first lab
-and deployment target. Pin a supported Go toolchain during phase 01 rather than
+and deployment target. Phase 00 pins the Go toolchain in `go.mod` rather than
 assuming the original author's installed toolchain is current.
 
 ## Working through the plan
@@ -192,7 +194,8 @@ experiment is not production qualification.
 If a phase is too large or hits an unresolved feasibility question, stop with a
 concrete handoff in that phase. Keep stable filenames and add bounded substeps
 there rather than silently broadening the turn or growing this README. Contract
-changes need an explicit owner decision; progress updates do not belong here.
+changes need an explicit owner decision; progress detail belongs in phase files,
+not here, beyond ticking the checklist.
 Do not commit, publish, create a remote repository, or deploy automatically.
 
 ## License and reference material

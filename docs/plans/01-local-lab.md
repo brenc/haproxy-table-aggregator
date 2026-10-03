@@ -2,7 +2,7 @@
 
 Status: not started
 
-Depends on: [the agreed contract](README.md).
+Depends on: [00](00-dev-tooling.md).
 
 ## One-turn outcome
 
@@ -11,8 +11,8 @@ traffic, inspects their local tables, and reliably cleans up. No aggregator yet.
 
 ## Work
 
-- Create the Go module and minimal testing layout. Resolve and pin a supported
-  Go toolchain using current official documentation. Keep dependencies small.
+- Create the minimal testing layout on the phase 00 module and toolchain.
+  Keep dependencies small.
 - Accept an explicit HAProxy path. Add a reproducible acquisition/build recipe
   for unmodified 3.4.6 and 3.2.25, recording source/artifact checksums, compiler,
   build flags, and `haproxy -vv`. Do not vendor the existing patched binary.

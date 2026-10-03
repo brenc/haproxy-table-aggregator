@@ -15,22 +15,22 @@ The values below are a reproducible qualification workload, not a claimed
 production capacity. Freeze its manifest before running implementation tests;
 record any proposed change here with a reason and keep prior results comparable.
 
-| Parameter | Baseline |
-| --- | --- |
-| Sources | 4 stock HAProxy processes |
-| Transport | Mutual TLS |
-| Initial live keys | 100,000 per source |
-| Overlap | 50,000 shared by all sources; 50,000 unique per source |
-| Key type | IPv6, including a deterministic mix of IPv4-mapped keys |
-| Rate period | 60 seconds |
-| Source expiry | 10 minutes for this retention/load test |
-| Source table capacity | 300,000 entries per source |
-| Offered traffic | 10,000 HTTP requests/second/source; report achieved rate |
-| Key selection | Seeded distribution: 80% to a 10% hot set, 20% to remaining keys |
-| Warm-up | 60 seconds after initial population and synchronization |
-| Steady measurement | 120 seconds |
-| Churn measurement | 120 seconds, replacing 1,000 active keys/second/source |
-| Latency objective | End-to-end p99 at most 250 ms while authoritative |
+| Parameter             | Baseline                                                         |
+| --------------------- | ---------------------------------------------------------------- |
+| Sources               | 4 stock HAProxy processes                                        |
+| Transport             | Mutual TLS                                                       |
+| Initial live keys     | 100,000 per source                                               |
+| Overlap               | 50,000 shared by all sources; 50,000 unique per source           |
+| Key type              | IPv6, including a deterministic mix of IPv4-mapped keys          |
+| Rate period           | 60 seconds                                                       |
+| Source expiry         | 10 minutes for this retention/load test                          |
+| Source table capacity | 300,000 entries per source                                       |
+| Offered traffic       | 10,000 HTTP requests/second/source; report achieved rate         |
+| Key selection         | Seeded distribution: 80% to a 10% hot set, 20% to remaining keys |
+| Warm-up               | 60 seconds after initial population and synchronization          |
+| Steady measurement    | 120 seconds                                                      |
+| Churn measurement     | 120 seconds, replacing 1,000 active keys/second/source           |
+| Latency objective     | End-to-end p99 at most 250 ms while authoritative                |
 
 During churn, the active set stays at 100,000 keys/source. Retired keys remain
 until their normal expiry, so resident state can grow to about 220,000/source
