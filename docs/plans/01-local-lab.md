@@ -2,7 +2,7 @@
 
 Status: not started
 
-Depends on: [the agreed contract](../../README.md).
+Depends on: [the agreed contract](README.md).
 
 ## One-turn outcome
 

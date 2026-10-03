@@ -1,26 +1,26 @@
-# HAProxy Table Aggregator
+# HAProxy Table Aggregator Implementation Plan
 
 ## Implementation checklist
 
-- [ ] [01 — Reproducible local lab](docs/plans/01-local-lab.md)
-- [ ] [02 — Wire framing and integers](docs/plans/02-wire-framing.md)
-- [ ] [03 — Table and entry messages](docs/plans/03-table-messages.md)
-- [ ] [04 — Peer sessions](docs/plans/04-peer-sessions.md)
-- [ ] [05 — Output tables and isolation](docs/plans/05-output-isolation.md)
-- [ ] [06 — Freshness feasibility gate](docs/plans/06-freshness-gate.md)
-- [ ] [07 — Source snapshots](docs/plans/07-source-snapshots.md)
-- [ ] [08 — Counter aggregation](docs/plans/08-counter-aggregation.md)
-- [ ] [09 — Rate evaluation](docs/plans/09-rate-evaluation.md)
-- [ ] [10 — Publication and enforcement](docs/plans/10-publication-enforcement.md)
-- [ ] [11 — Restart and reconnect recovery](docs/plans/11-recovery.md)
-- [ ] [12 — Reload continuity gate](docs/plans/12-reload-continuity.md)
-- [ ] [13 — Mutual TLS and peer authorization](docs/plans/13-peer-security.md)
-- [ ] [14 — Resource bounds](docs/plans/14-resource-bounds.md)
-- [ ] [15 — Operational visibility](docs/plans/15-observability.md)
-- [ ] [16 — Failure qualification](docs/plans/16-failure-qualification.md)
-- [ ] [17 — Upstream compatibility and CI](docs/plans/17-compatibility-ci.md)
-- [ ] [18 — Load qualification](docs/plans/18-load-qualification.md)
-- [ ] [19 — Staging shadow preparation](docs/plans/19-staging-shadow.md)
+- [ ] [01 — Reproducible local lab](01-local-lab.md)
+- [ ] [02 — Wire framing and integers](02-wire-framing.md)
+- [ ] [03 — Table and entry messages](03-table-messages.md)
+- [ ] [04 — Peer sessions](04-peer-sessions.md)
+- [ ] [05 — Output tables and isolation](05-output-isolation.md)
+- [ ] [06 — Freshness feasibility gate](06-freshness-gate.md)
+- [ ] [07 — Source snapshots](07-source-snapshots.md)
+- [ ] [08 — Counter aggregation](08-counter-aggregation.md)
+- [ ] [09 — Rate evaluation](09-rate-evaluation.md)
+- [ ] [10 — Publication and enforcement](10-publication-enforcement.md)
+- [ ] [11 — Restart and reconnect recovery](11-recovery.md)
+- [ ] [12 — Reload continuity gate](12-reload-continuity.md)
+- [ ] [13 — Mutual TLS and peer authorization](13-peer-security.md)
+- [ ] [14 — Resource bounds](14-resource-bounds.md)
+- [ ] [15 — Operational visibility](15-observability.md)
+- [ ] [16 — Failure qualification](16-failure-qualification.md)
+- [ ] [17 — Upstream compatibility and CI](17-compatibility-ci.md)
+- [ ] [18 — Load qualification](18-load-qualification.md)
+- [ ] [19 — Staging shadow preparation](19-staging-shadow.md)
 
 This checklist is a stable navigation index, not a live progress dashboard.
 **Update only the relevant phase file for planning and progress:** its status,
@@ -197,7 +197,7 @@ Do not commit, publish, create a remote repository, or deploy automatically.
 
 ## License and reference material
 
-New project code and these documents use the [MIT license](LICENSE). Write
+New project code and these documents use the [MIT license](../../LICENSE). Write
 original Go code and fresh test fixtures. Referencing a protocol or observing
 behavior does not mean copying its implementation. Do not relicense copied or
 translated third-party code as MIT; evaluate and record any proposed reuse
