@@ -46,6 +46,18 @@
 // SessionUp and SessionDown wait for room until the manager closes (and
 // then at most the event timeout), so the application learns of every
 // session end unless it stops draining the queue.
+//
+// # Output
+//
+// With output tables configured, the manager owns one output.Store that
+// every session teaches to its source (see package peersession): each
+// table once the source has announced a matching definition of it, the
+// whole store whenever the source requests a resync, then each change as
+// Publish makes it. Sessions read the store
+// independently, so a slow source delays only its own session. Output is
+// never an input: the sources' copies of output tables are acknowledged
+// but never queued as events, and no session ever announces an input
+// table.
 package sources
 
 import (
@@ -59,6 +71,7 @@ import (
 	"time"
 
 	"github.com/brenc/haproxy-table-aggregator/internal/config"
+	"github.com/brenc/haproxy-table-aggregator/internal/output"
 	"github.com/brenc/haproxy-table-aggregator/internal/peermsg"
 	"github.com/brenc/haproxy-table-aggregator/internal/peersession"
 )
@@ -100,12 +113,18 @@ type Options struct {
 	Dial func(ctx context.Context, address string) (net.Conn, error)
 	// Logger receives operational logs. Nil discards them.
 	Logger *slog.Logger
+	// Output, if non-nil, is the output store to teach instead of a new
+	// empty one, so that entries published before Start are taught when
+	// the first sessions start. Its tables must be exactly the
+	// configuration's outputs, in order.
+	Output *output.Store
 }
 
 // Manager runs the sessions of every configured source.
 type Manager struct {
 	cfg      config.Config
 	sessOpts peersession.Options
+	out      *output.Store
 	log      *slog.Logger
 	dial     func(ctx context.Context, address string) (net.Conn, error)
 	ln       net.Listener
@@ -171,8 +190,31 @@ func Start(ctx context.Context, opts Options) (*Manager, error) {
 		}
 		tables[t.Name] = peersession.TableSpec{Period: peermsg.Millis(ms)}
 	}
+	out := opts.Output
+	if out != nil {
+		if err := sameOutputs(out, cfg.OutputTables()); err != nil {
+			return nil, err
+		}
+	}
+	if len(cfg.Outputs) > 0 {
+		if !cfg.RequestResync {
+			return nil, fmt.Errorf("sources: %w: output tables need RequestResync", config.ErrInvalid)
+		}
+		if out == nil {
+			var err error
+			if out, err = output.NewStore(cfg.OutputTables()); err != nil {
+				return nil, fmt.Errorf("sources: %w", err)
+			}
+		}
+		for _, t := range cfg.Outputs {
+			if _, ok := tables[t.Name]; ok {
+				return nil, fmt.Errorf("sources: output table %s is also an input table", t.Name)
+			}
+		}
+	}
 	m := &Manager{
 		cfg: cfg,
+		out: out,
 		sessOpts: peersession.Options{
 			LocalPeer:        cfg.LocalPeer,
 			Tables:           tables,
@@ -181,6 +223,7 @@ func Start(ctx context.Context, opts Options) (*Manager, error) {
 			HandshakeTimeout: cfg.HandshakeTimeout,
 			MaxTables:        cfg.MaxSessionTables,
 			RequestResync:    cfg.RequestResync,
+			Output:           out,
 		},
 		log:     log,
 		dial:    opts.Dial,
@@ -218,12 +261,40 @@ func Start(ctx context.Context, opts Options) (*Manager, error) {
 	return m, nil
 }
 
+// sameOutputs requires a store's tables to be the configured outputs.
+func sameOutputs(s *output.Store, want []output.Table) error {
+	got := s.Tables()
+	if len(got) != len(want) {
+		return fmt.Errorf("sources: output store has %d tables, configuration %d", len(got), len(want))
+	}
+	for i, w := range want {
+		d := output.Definition(w.Name, w.Expiry)
+		k, _ := s.Kind(got[i].Name)
+		if g := got[i]; g.Name != d.Name || g.Expiry != d.Expiry || k != w.Kind {
+			return fmt.Errorf("sources: output store table %d is %v table %s expiring after %v, configuration "+
+				"has %v table %s after %v", i, k, g.Name, g.Expiry, w.Kind, d.Name, d.Expiry)
+		}
+	}
+	return nil
+}
+
 // Addr returns the listener's address, or nil without a listener.
 func (m *Manager) Addr() net.Addr {
 	if m.ln == nil {
 		return nil
 	}
 	return m.ln.Addr()
+}
+
+// Publish sets the values of key in the output table named table, for
+// every current and future session to teach. Publishing unchanged values
+// sends nothing. It fails, wrapping output.ErrInvalid, for a table that is
+// not a configured output or values its kind does not allow.
+func (m *Manager) Publish(table string, key peermsg.Key, values output.Values) error {
+	if m.out == nil {
+		return fmt.Errorf("%w: no output tables configured", output.ErrInvalid)
+	}
+	return m.out.Set(table, key, values)
 }
 
 // Events returns the event queue. It is closed after Close once every

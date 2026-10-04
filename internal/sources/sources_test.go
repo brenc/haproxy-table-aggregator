@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/brenc/haproxy-table-aggregator/internal/config"
+	"github.com/brenc/haproxy-table-aggregator/internal/output"
 	"github.com/brenc/haproxy-table-aggregator/internal/peermsg"
 	"github.com/brenc/haproxy-table-aggregator/internal/peersession"
 	"github.com/brenc/haproxy-table-aggregator/internal/peerwire"
@@ -524,6 +525,7 @@ func TestCloseReleasesEverything(t *testing.T) {
 	addr := ln.Addr().String()
 	cfg := fastConfig(config.Source{Name: "a"}, config.Source{Name: "b", Address: srv.addr()})
 	cfg.IdleTimeout = time.Minute // nothing may end on its own
+	cfg.Outputs = outCfg          // each session also runs an output watcher
 	m, err := sources.Start(context.Background(), sources.Options{Config: cfg, Listener: ln})
 	if err != nil {
 		t.Fatal(err)
@@ -539,6 +541,9 @@ func TestCloseReleasesEverything(t *testing.T) {
 	r.waitFor("both up", fakeTimeout, func(evs []sources.Event) bool {
 		return len(ups(evs, "a")) == 1 && len(ups(evs, "b")) == 1
 	})
+	if err := m.Publish("t_out", mustKey(t, "2001:db8::"), output.AggregateValues(1)); err != nil {
+		t.Fatal(err)
+	}
 
 	start := time.Now()
 	if err := m.Close(); err != nil {
