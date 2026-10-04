@@ -164,6 +164,17 @@ func TestRunEvents(t *testing.T) {
 		}
 		got = append(got, buf[:n]...)
 	}
+	// The snapshot store saw the complete sync: the only source, and
+	// so the roster, became ready.
+	for deadline := time.Now().Add(5 * time.Second); !strings.Contains(errOut.String(), "roster ready"); {
+		if time.Now().After(deadline) {
+			t.Fatalf("roster never ready; log:\n%s", errOut.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !strings.Contains(errOut.String(), "source=a state=ready session=1 entries=1") {
+		t.Fatalf("no ready source with its entry; log:\n%s", errOut.String())
+	}
 	stopAt := time.Now()
 	cancel()
 	if err := <-done; err != nil {

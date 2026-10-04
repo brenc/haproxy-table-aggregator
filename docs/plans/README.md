@@ -9,7 +9,7 @@
 - [x] [04 — Peer sessions](04-peer-sessions.md)
 - [x] [05 — Output tables and isolation](05-output-isolation.md)
 - [x] [06 — Freshness feasibility gate](06-freshness-gate.md)
-- [ ] [07 — Source snapshots](07-source-snapshots.md)
+- [x] [07 — Source snapshots](07-source-snapshots.md)
 - [ ] [08 — Counter aggregation](08-counter-aggregation.md)
 - [ ] [09 — Rate evaluation](09-rate-evaluation.md)
 - [ ] [10 — Publication and enforcement](10-publication-enforcement.md)

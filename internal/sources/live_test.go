@@ -219,7 +219,7 @@ func TestLiveSessions(t *testing.T) {
 	m, r := startManager(t, sources.Options{Config: cfg, Listener: ln})
 
 	evs := r.waitFor("both sessions up and resynced", 20*time.Second, func(evs []sources.Event) bool {
-		return count[peersession.SyncFinished](evs, "a") == 1 && count[peersession.SyncFinished](evs, "b") == 1
+		return resyncedSessions(evs, "a", true) == 1 && resyncedSessions(evs, "b", true) == 1
 	})
 	for _, src := range []string{"a", "b"} {
 		up := ups(evs, src)[0]
@@ -315,7 +315,7 @@ func TestLiveSessions(t *testing.T) {
 		}
 	}
 	evs = r.waitFor("second sessions up and resynced", 20*time.Second, func(evs []sources.Event) bool {
-		return count[peersession.SyncFinished](evs, "a") == 2 && count[peersession.SyncFinished](evs, "b") == 2
+		return resyncedSessions(evs, "a", true) == 2 && resyncedSessions(evs, "b", true) == 2
 	})
 	for _, src := range []string{"a", "b"} {
 		u := ups(evs, src)

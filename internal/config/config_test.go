@@ -42,7 +42,8 @@ func TestExampleAndDefaults(t *testing.T) {
 		c.HandshakeTimeout != config.DefaultHandshakeTimeout || c.ReconnectMin != config.DefaultReconnectMin ||
 		c.ReconnectMax != config.DefaultReconnectMax || c.EventQueue != config.DefaultEventQueue ||
 		c.EventTimeout != config.DefaultEventTimeout || c.MaxSessionTables != config.DefaultMaxSessionTables ||
-		!c.RequestResync {
+		!c.RequestResync || c.HealthTimeout != config.DefaultHealthTimeout ||
+		c.MaxSourceEntries != config.DefaultMaxSourceEntries {
 		t.Fatalf("defaults not applied: %+v", c)
 	}
 	if s, ok := c.Source("b"); !ok || s.Address == "" {
@@ -138,6 +139,10 @@ func TestInvalid(t *testing.T) {
 		"output expire sub-ms":     edit(`"expire": "30s"`, `"expire": "1500us"`),
 		"more tables than session": addField(`"max_session_tables": 2`),
 		"outputs without resync":   addField(`"request_resync": false`),
+		"short health timeout":     addField(`"health_timeout": "3s"`),
+		"long health timeout":      addField(`"health_timeout": "9s"`),
+		"no source entries":        addField(`"max_source_entries": 0`),
+		"too many source entries":  addField(`"max_source_entries": 4194305`),
 		"more inputs than session": edit(`[{"name": "lab_in", "period": "10s"}]`,
 			`[{"name": "x", "period": "1s"}, {"name": "y", "period": "1s"}], "max_session_tables": 1`),
 	}
@@ -168,7 +173,8 @@ func TestValidVariants(t *testing.T) {
 			`{"name": "a"}`, `{"name": "a", "address": "127.0.0.2:1"}`, 1),
 		"no outputs": strings.Split(example, ",\n  \"outputs\"")[0] + "\n}",
 		"timing set": strings.Replace(strings.Split(example, ",\n  \"outputs\"")[0]+"\n}", `"local_peer": "agg",`,
-			`"local_peer": "agg", "heartbeat": "1s", "idle_timeout": "4s", "event_timeout": "500ms", "request_resync": false,`, 1),
+			`"local_peer": "agg", "heartbeat": "1s", "idle_timeout": "4s", "event_timeout": "500ms", "request_resync": false, `+
+				`"health_timeout": "4s", "max_source_entries": 10,`, 1),
 	}
 	for name, doc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -176,7 +182,8 @@ func TestValidVariants(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if name == "timing set" && (c.Heartbeat != time.Second || c.RequestResync) {
+			if name == "timing set" && (c.Heartbeat != time.Second || c.RequestResync ||
+				c.HealthTimeout != 4*time.Second || c.MaxSourceEntries != 10) {
 				t.Fatalf("%+v", c)
 			}
 			if name == "no outputs" && len(c.Outputs) != 0 {

@@ -6,9 +6,9 @@ import (
 	"github.com/brenc/haproxy-table-aggregator/internal/peermsg"
 )
 
-// Event is a validated session event: one of TableDefined, EntryUpdated,
-// or SyncFinished, delivered by Run, or SessionUp or SessionDown, which
-// package sources emits around Run.
+// Event is a validated session event: one of TableDefined,
+// TableRejected, EntryUpdated, or SyncFinished, delivered by Run, or
+// SessionUp or SessionDown, which package sources emits around Run.
 type Event interface{ event() }
 
 // Direction says which side opened the connection.
@@ -72,6 +72,22 @@ type TableDefined struct {
 	Received time.Time
 }
 
+// TableRejected reports an input table whose announced definition is
+// outside the supported subset or differs from its configured schema. The
+// session ends with ErrSchema right after it, so no update of the table
+// is ever delivered or acknowledged; the event lets the application
+// record which logical table failed and why.
+type TableRejected struct {
+	// ID is the source's table ID, meaningful only within this session.
+	ID peermsg.RemoteTableID
+	// Table is the table name.
+	Table string
+	// Err is the schema error the session ends with; it wraps ErrSchema.
+	Err error
+	// Received is when the definition was read.
+	Received time.Time
+}
+
 // EntryUpdated is one decoded update of an input table.
 type EntryUpdated struct {
 	// ID is the source's table ID, meaningful only within this session.
@@ -85,17 +101,21 @@ type EntryUpdated struct {
 	Update peermsg.Update
 }
 
-// SyncFinished reports the source's reply to this session's resync
-// request: Partial is false for "finished" and true for "partial" (the
-// source is not itself fully synchronized). Phase 07 decides what
-// completeness means; this event only reports the control.
+// SyncFinished reports the source's reply to one of this session's
+// resync requests: Partial is false for "finished" and true for "partial"
+// (the source is not itself fully synchronized yet). Every update the
+// source taught in answer precedes it. After a "partial" reply the
+// session requests another resync once Options.ResyncRetry has passed, so
+// a session may report several partial replies before a finished one; it
+// requests nothing more after "finished".
 type SyncFinished struct {
 	Partial  bool
 	Received time.Time
 }
 
-func (SessionUp) event()    {}
-func (SessionDown) event()  {}
-func (TableDefined) event() {}
-func (EntryUpdated) event() {}
-func (SyncFinished) event() {}
+func (SessionUp) event()     {}
+func (SessionDown) event()   {}
+func (TableDefined) event()  {}
+func (TableRejected) event() {}
+func (EntryUpdated) event()  {}
+func (SyncFinished) event()  {}

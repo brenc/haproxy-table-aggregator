@@ -115,6 +115,20 @@ func count[T peersession.Event](evs []sources.Event, source string) int {
 	return n
 }
 
+// resyncedSessions counts the source's sessions that got a reply to the
+// daemon's resync request: any reply, or with finishedOnly a "finished"
+// one. A session may get several "partial" replies, since it asks again
+// after each (sources.Options.ResyncRetry).
+func resyncedSessions(evs []sources.Event, source string, finishedOnly bool) int {
+	seen := map[uint64]bool{}
+	for _, ev := range evs {
+		if s, ok := ev.Body.(peersession.SyncFinished); ok && ev.Source == source && (!finishedOnly || !s.Partial) {
+			seen[ev.Session] = true
+		}
+	}
+	return len(seen)
+}
+
 // ups returns the source's SessionUp events in order.
 func ups(evs []sources.Event, source string) []sources.Event {
 	var out []sources.Event

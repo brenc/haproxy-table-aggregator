@@ -1,7 +1,10 @@
 // Command htad is the aggregator daemon. In this phase it keeps one
-// peers-protocol session per configured HAProxy source and writes each
-// validated session and table event to stdout as one JSON object per line;
-// it aggregates nothing and keeps no state across restarts.
+// peers-protocol session per configured HAProxy source, writes each
+// validated session and table event to stdout as one JSON object per line,
+// and keeps each source's validated, expiring snapshot in memory (package
+// snapshot), logging every source state change and roster readiness. It
+// aggregates nothing, publishes nothing, and keeps no state across
+// restarts.
 //
 //	htad -config htad.json [-log-level info]
 //
@@ -24,6 +27,7 @@ import (
 	"time"
 
 	"github.com/brenc/haproxy-table-aggregator/internal/config"
+	"github.com/brenc/haproxy-table-aggregator/internal/snapshot"
 	"github.com/brenc/haproxy-table-aggregator/internal/sources"
 )
 
@@ -50,6 +54,48 @@ func main() {
 // error.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	return runWith(ctx, args, stdout, stderr, nil)
+}
+
+// maintainInterval is how often the daemon feeds session liveness into the
+// snapshot store, expires entries, and reports state changes. Reads judge
+// health and expiry at their own time, so it only bounds how late a
+// change is logged and expired memory is released.
+const maintainInterval = 250 * time.Millisecond
+
+// maintain runs the snapshot store's housekeeping until ctx ends: it
+// records each session's last message read (heartbeats included, which
+// produce no events), removes expired entries, and logs every source
+// state change and every change of roster readiness.
+func maintain(ctx context.Context, m *sources.Manager, store *snapshot.Store, log *slog.Logger) {
+	tick := time.NewTicker(maintainInterval)
+	defer tick.Stop()
+	states := map[string]snapshot.State{}
+	ready := false
+	for {
+		store.ObserveStatus(m.Status())
+		store.Expire()
+		r := store.Roster()
+		for _, src := range r.Sources {
+			if states[src.Name] != src.State {
+				states[src.Name] = src.State
+				log.Info("source state", "source", src.Name, "state", src.State.String(), "session", src.Session,
+					"entries", src.Entries, "reason", src.Reason)
+			}
+		}
+		if r.Ready != ready {
+			ready = r.Ready
+			if ready {
+				log.Info("roster ready", "sources", len(r.Sources))
+			} else {
+				log.Info("roster not ready", "not_ready", len(r.NotReady()))
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 // outputDrainTimeout bounds how long shutdown waits for the event writer.
@@ -85,10 +131,23 @@ func runWith(ctx context.Context, args []string, stdout, stderr io.Writer, ready
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	m, err := sources.Start(ctx, sources.Options{Config: cfg, Logger: log})
+	store, err := snapshot.New(snapshot.OptionsFrom(cfg))
 	if err != nil {
 		return err
 	}
+	m, err := sources.Start(ctx, sources.Options{Config: cfg, Logger: log, Apply: store.Apply})
+	if err != nil {
+		return err
+	}
+	maintained := make(chan struct{})
+	go func() {
+		defer close(maintained)
+		maintain(ctx, m, store, log)
+	}()
+	defer func() {
+		cancel()
+		<-maintained
+	}()
 	if addr := m.Addr(); addr != nil {
 		log.Info("listening", "address", addr.String(), "local_peer", cfg.LocalPeer)
 	}

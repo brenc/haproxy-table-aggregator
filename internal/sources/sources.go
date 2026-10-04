@@ -47,6 +47,11 @@
 // then at most the event timeout), so the application learns of every
 // session end unless it stops draining the queue.
 //
+// With Options.Apply the application also receives each event
+// synchronously before it is queued, and can refuse a table event; an
+// update is then acknowledged only once Apply accepted it (package
+// snapshot keeps the per-source state this way).
+//
 // # Output
 //
 // With output tables configured, the manager owns one output.Store that
@@ -84,7 +89,7 @@ type Event struct {
 	// became current.
 	Session uint64
 	// Body is a peersession.SessionUp, SessionDown, TableDefined,
-	// EntryUpdated, or SyncFinished.
+	// TableRejected, EntryUpdated, or SyncFinished.
 	Body peersession.Event
 }
 
@@ -118,6 +123,22 @@ type Options struct {
 	// the first sessions start. Its tables must be exactly the
 	// configuration's outputs, in order.
 	Output *output.Store
+	// Apply, if non-nil, receives every event synchronously, in the
+	// goroutine of the session it belongs to, before the event is
+	// queued: so for one source it sees events in exactly the queue's
+	// order, and it may be called concurrently for different sources.
+	// For a table event, a non-nil error refuses it: the session ends
+	// without acknowledging the update the event carried (or any later
+	// one), and the event is not queued. So an update is acknowledged
+	// only once Apply accepted it. SessionUp is applied once queued, and
+	// SessionDown always, even when the queue no longer takes it; Apply's
+	// result for them is ignored. Apply must return promptly, and must
+	// not call the Manager.
+	Apply func(Event) error
+	// ResyncRetry is how long after a "partial" resync reply each session
+	// requests another resync (peersession.Options.ResyncRetry): zero
+	// means DefaultResyncRetry, negative never retries.
+	ResyncRetry time.Duration
 	// OutputRefresh overrides how often each session re-sends the whole
 	// output (peersession.Options.Refresh): zero keeps the default, a
 	// third of the shortest aggregate table expire; negative disables
@@ -125,12 +146,19 @@ type Options struct {
 	OutputRefresh time.Duration
 }
 
+// DefaultResyncRetry is how long a session waits after a "partial" resync
+// reply before asking again. HAProxy answers "partial" until its own
+// startup or reload resynchronization ends, which it bounds by a few
+// seconds, so a short fixed retry soon gets a complete teach.
+const DefaultResyncRetry = time.Second
+
 // Manager runs the sessions of every configured source.
 type Manager struct {
 	cfg      config.Config
 	sessOpts peersession.Options
 	out      *output.Store
 	log      *slog.Logger
+	apply    func(Event) error
 	dial     func(ctx context.Context, address string) (net.Conn, error)
 	ln       net.Listener
 	events   chan Event
@@ -217,9 +245,14 @@ func Start(ctx context.Context, opts Options) (*Manager, error) {
 			}
 		}
 	}
+	retry := opts.ResyncRetry
+	if retry == 0 {
+		retry = DefaultResyncRetry
+	}
 	m := &Manager{
-		cfg: cfg,
-		out: out,
+		cfg:   cfg,
+		out:   out,
+		apply: opts.Apply,
 		sessOpts: peersession.Options{
 			LocalPeer:        cfg.LocalPeer,
 			Tables:           tables,
@@ -228,6 +261,7 @@ func Start(ctx context.Context, opts Options) (*Manager, error) {
 			HandshakeTimeout: cfg.HandshakeTimeout,
 			MaxTables:        cfg.MaxSessionTables,
 			RequestResync:    cfg.RequestResync,
+			ResyncRetry:      retry,
 			Output:           out,
 			Refresh:          opts.OutputRefresh,
 		},
@@ -521,6 +555,11 @@ func (m *Manager) run(sl *slot, a *active, up peersession.SessionUp) {
 // emit queues a table event, waiting at most the event timeout.
 func (m *Manager) emit(ctx context.Context, sl *slot, a *active, ev peersession.Event) error {
 	e := Event{Source: sl.name, Session: a.gen, Body: ev}
+	if m.apply != nil {
+		if err := m.apply(e); err != nil {
+			return err
+		}
+	}
 	select {
 	case m.events <- e:
 		return nil
@@ -544,6 +583,18 @@ func (m *Manager) emit(ctx context.Context, sl *slot, a *active, ev peersession.
 // end. It reports whether the event was queued.
 func (m *Manager) emitLifecycle(sl *slot, a *active, ev peersession.Event) bool {
 	e := Event{Source: sl.name, Session: a.gen, Body: ev}
+	_, down := ev.(peersession.SessionDown)
+	if down && m.apply != nil {
+		_ = m.apply(e)
+	}
+	queued := m.queueLifecycle(e)
+	if !down && queued && m.apply != nil {
+		_ = m.apply(e)
+	}
+	return queued
+}
+
+func (m *Manager) queueLifecycle(e Event) bool {
 	select {
 	case m.events <- e:
 		return true

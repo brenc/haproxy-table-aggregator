@@ -64,6 +64,9 @@ func writeEvent(w io.Writer, ev sources.Event) error {
 		for _, f := range b.Definition.Fields {
 			line.Fields = append(line.Fields, f.String())
 		}
+	case peersession.TableRejected:
+		line.Type, line.Time = "table_rejected", b.Received
+		line.Table, line.TableID, line.Error = b.Table, uint32(b.ID), b.Err.Error()
 	case peersession.EntryUpdated:
 		line.Type, line.Time = "entry_updated", b.Update.Received
 		line.Table, line.TableID = b.Table, uint32(b.ID)

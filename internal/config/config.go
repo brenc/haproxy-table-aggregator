@@ -73,6 +73,19 @@ const (
 	DefaultEventQueue       = 1024
 	DefaultEventTimeout     = time.Second
 	DefaultMaxSessionTables = 32
+	DefaultHealthTimeout    = 5 * time.Second
+	DefaultMaxSourceEntries = 1 << 17
+)
+
+// Limits on source health and snapshot capacity. A source counts as
+// healthy only while its last message is younger than the health timeout;
+// HAProxy heartbeats every 3 seconds when idle, so a timeout below 4
+// seconds would fail quiet but healthy sources, and above 8 seconds a
+// silent source could not fall back within the 10-second target.
+const (
+	MinHealthTimeout    = 4 * time.Second
+	MaxHealthTimeout    = 8 * time.Second
+	MaxMaxSourceEntries = 1 << 22
 )
 
 // Limits on timing settings. HAProxy declares a peer dead when a whole
@@ -133,8 +146,17 @@ type Config struct {
 	// is at least the number of input and output tables.
 	MaxSessionTables int
 	// RequestResync makes each new session ask its source for a full
-	// resynchronization.
+	// resynchronization. A source becomes ready only after a complete
+	// one, so without it no source is ever ready.
 	RequestResync bool
+	// HealthTimeout is the source-health bound: a source is healthy only
+	// while its session's last processed message was read less than this
+	// long ago (see package snapshot).
+	HealthTimeout time.Duration
+	// MaxSourceEntries bounds the snapshot entries kept for one source,
+	// across its input tables. An update that would exceed it is refused
+	// and degrades the source.
+	MaxSourceEntries int
 }
 
 // Source is one configured source peer. Its Name is both its logical
@@ -225,6 +247,8 @@ type File struct {
 	EventTimeout                 *Duration    `json:"event_timeout"`
 	MaxSessionTables             *int         `json:"max_session_tables"`
 	RequestResync                *bool        `json:"request_resync"`
+	HealthTimeout                *Duration    `json:"health_timeout"`
+	MaxSourceEntries             *int         `json:"max_source_entries"`
 }
 
 // FileSource is one entry of File.Sources.
@@ -524,6 +548,18 @@ func (c *Config) setTiming(f File) error {
 	if n := len(c.Tables) + len(c.Outputs); c.MaxSessionTables < n {
 		return invalid("max_session_tables %d is below the %d configured input and output tables; every table a "+
 			"source shares in a session counts, input or not", c.MaxSessionTables, n)
+	}
+	c.HealthTimeout = durationOr(f.HealthTimeout, DefaultHealthTimeout)
+	if c.HealthTimeout < MinHealthTimeout || c.HealthTimeout > MaxHealthTimeout {
+		return invalid("health_timeout: %v is outside %v..%v; HAProxy heartbeats every 3s when idle, and a silent "+
+			"source must fall back within 10s", c.HealthTimeout, MinHealthTimeout, MaxHealthTimeout)
+	}
+	c.MaxSourceEntries = DefaultMaxSourceEntries
+	if f.MaxSourceEntries != nil {
+		c.MaxSourceEntries = *f.MaxSourceEntries
+	}
+	if c.MaxSourceEntries < 1 || c.MaxSourceEntries > MaxMaxSourceEntries {
+		return invalid("max_source_entries: %d is outside 1..%d", c.MaxSourceEntries, MaxMaxSourceEntries)
 	}
 	c.RequestResync = f.RequestResync == nil || *f.RequestResync
 	if len(c.Outputs) > 0 && !c.RequestResync {

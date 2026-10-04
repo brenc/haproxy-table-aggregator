@@ -18,7 +18,9 @@
 //   - Learning (LearnState): with Options.RequestResync the session sends a
 //     resync request as soon as it is established and expects exactly one
 //     "finished" or "partial" control in reply, which it confirms. Either
-//     reply without a request is a protocol error.
+//     reply without an outstanding request is a protocol error. After
+//     "partial", the session requests again once Options.ResyncRetry has
+//     passed, until a reply is "finished".
 //   - Teaching (pending confirms): a resync request from the source is
 //     answered with a full teach of the output (if any; see below) and
 //     then "finished". Each "finished" sent must be confirmed once; a
@@ -78,7 +80,8 @@
 // never announced or for an update it did not send in this session. An
 // input or output table whose definition is outside the supported subset
 // or differs from its configured schema ends the session without an error
-// message. Tables that are neither inputs nor outputs are ignored,
+// message; for an input table the sink first receives a TableRejected
+// event naming it. Tables that are neither inputs nor outputs are ignored,
 // whatever their schema: their updates are neither decoded nor
 // acknowledged, as HAProxy ignores tables it does not share.
 //

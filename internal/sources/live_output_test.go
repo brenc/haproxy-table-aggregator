@@ -218,7 +218,7 @@ func TestLiveOutput(t *testing.T) {
 	// Keep the output authoritative so that the ACL applies it.
 	defer renewLease(t, store)()
 	r.waitFor("both sessions up, resynced, and inputs replayed", 20*time.Second, func(evs []sources.Event) bool {
-		return count[peersession.SyncFinished](evs, "a") == 1 && count[peersession.SyncFinished](evs, "b") == 1 &&
+		return resyncedSessions(evs, "a", true) == 1 && resyncedSessions(evs, "b", true) == 1 &&
 			countIs("a", keyA, 10)(evs) && countIs("b", keyB, 20)(evs)
 	})
 
@@ -376,7 +376,7 @@ func TestLiveOutput(t *testing.T) {
 		}
 	}
 	r.waitFor("second sessions up, resynced, and inputs replayed", 20*time.Second, func(evs []sources.Event) bool {
-		return count[peersession.SyncFinished](evs, "a") == 2 && count[peersession.SyncFinished](evs, "b") == 2 &&
+		return resyncedSessions(evs, "a", true) == 2 && resyncedSessions(evs, "b", true) == 2 &&
 			replayed(evs, "a", keyA, 10) && replayed(evs, "b", keyB, 20)
 	})
 	for _, src := range []string{"a", "b"} {

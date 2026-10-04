@@ -805,7 +805,7 @@ func TestLiveFreshnessReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.r.waitFor("the reloaded node's session", 30*time.Second, func(evs []sources.Event) bool {
-		return count[peersession.SyncFinished](evs, "a") >= 2
+		return resyncedSessions(evs, "a", false) >= 2
 	})
 	time.Sleep(time.Second)
 	for _, d := range w.end() {

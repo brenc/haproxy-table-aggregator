@@ -72,6 +72,12 @@ type Options struct {
 	MaxTables int
 	// RequestResync sends a resync request once established.
 	RequestResync bool
+	// ResyncRetry, when positive, makes the session request another
+	// resync this long after the source answered one with "partial" (it
+	// is not itself synchronized yet, so what it taught may be
+	// incomplete). The session keeps retrying until a "finished" reply;
+	// zero or negative never retries.
+	ResyncRetry time.Duration
 	// PID is the process ID announced in this side's hello. Zero means
 	// the current process ID.
 	PID uint32
@@ -134,7 +140,9 @@ const (
 	LearnRequested
 	// LearnFinished: the source replied "finished"; confirmed.
 	LearnFinished
-	// LearnPartial: the source replied "partial"; confirmed.
+	// LearnPartial: the source replied "partial"; confirmed. With
+	// Options.ResyncRetry set, the session requests again once it has
+	// passed (back to LearnRequested); otherwise the state is final.
 	LearnPartial
 )
 
@@ -166,7 +174,13 @@ type Stats struct {
 	Updates         uint64
 	SkippedUpdates  uint64
 	AcksSent        uint64
-	LastRx          time.Time
+	// ResyncRequests counts the resync requests sent (see
+	// Options.ResyncRetry).
+	ResyncRequests uint64
+	// LastRx is when the last processed message was read; zero before
+	// the first. It carries a monotonic clock reading, so its age is
+	// immune to wall-clock steps.
+	LastRx time.Time
 	// EchoedUpdates counts updates of output tables received from the
 	// source (its copy of what this side published, replayed when it
 	// teaches): acknowledged, never delivered as events.
@@ -255,27 +269,29 @@ type Conn struct {
 	rxTime   time.Time // when the last read returned data
 	wbuf     []byte
 
-	phase        atomic.Uint32
-	learnA       atomic.Uint32
-	confirmsA    atomic.Uint32
-	rxMessages   atomic.Uint64
-	rxHeartbeats atomic.Uint64
-	txHeartbeats atomic.Uint64
-	updates      atomic.Uint64
-	skipped      atomic.Uint64
-	acksSent     atomic.Uint64
-	lastRxNano   atomic.Int64
-	nudgeAt      atomic.Int64 // UnixNano of a requested early heartbeat, or 0
-	echoed       atomic.Uint64
-	teaches      atomic.Uint64
-	outUpdates   atomic.Uint64
-	taught       atomic.Uint64
-	acksRecv     atomic.Uint64
-	outWake      atomic.Bool // the output store changed since the last send
-	markers      atomic.Uint64
-	revocations  atomic.Uint64
-	markerNano   atomic.Int64
-	markerDL     atomic.Uint32
+	phase          atomic.Uint32
+	learnA         atomic.Uint32
+	confirmsA      atomic.Uint32
+	rxMessages     atomic.Uint64
+	rxHeartbeats   atomic.Uint64
+	txHeartbeats   atomic.Uint64
+	updates        atomic.Uint64
+	skipped        atomic.Uint64
+	acksSent       atomic.Uint64
+	lastRxMono     atomic.Int64 // LastRx as time since monoBase, or 0
+	resyncAt       time.Time    // when to repeat a resync request, or zero
+	resyncRequests atomic.Uint64
+	nudgeAt        atomic.Int64 // UnixNano of a requested early heartbeat, or 0
+	echoed         atomic.Uint64
+	teaches        atomic.Uint64
+	outUpdates     atomic.Uint64
+	taught         atomic.Uint64
+	acksRecv       atomic.Uint64
+	outWake        atomic.Bool // the output store changed since the last send
+	markers        atomic.Uint64
+	revocations    atomic.Uint64
+	markerNano     atomic.Int64
+	markerDL       atomic.Uint32
 
 	// leaseSent is the lease generation last written (0: none), and
 	// markerDue forces the next publish to write the lease again, after
@@ -341,6 +357,10 @@ const readSize = 16 << 10
 // errorTimeout bounds the best-effort error status or message written
 // before a failed session ends.
 const errorTimeout = time.Second
+
+// monoBase anchors times shared across goroutines as monotonic offsets
+// (see Stats.LastRx).
+var monoBase = time.Now()
 
 // aLongTimeAgo is a deadline in the past, used to interrupt blocked I/O.
 var aLongTimeAgo = time.Unix(1, 0)
@@ -438,6 +458,7 @@ func (c *Conn) Stats() Stats {
 		Updates:         c.updates.Load(),
 		SkippedUpdates:  c.skipped.Load(),
 		AcksSent:        c.acksSent.Load(),
+		ResyncRequests:  c.resyncRequests.Load(),
 		EchoedUpdates:   c.echoed.Load(),
 		Teaches:         c.teaches.Load(),
 		OutputUpdates:   c.outUpdates.Load(),
@@ -450,8 +471,8 @@ func (c *Conn) Stats() Stats {
 		Rotations:       c.rotations.Load(),
 		Refreshes:       c.refreshes.Load(),
 	}
-	if n := c.lastRxNano.Load(); n != 0 {
-		s.LastRx = time.Unix(0, n)
+	if n := c.lastRxMono.Load(); n != 0 {
+		s.LastRx = monoBase.Add(time.Duration(n))
 	}
 	if n := c.markerNano.Load(); n != 0 {
 		s.LastMarker = time.Unix(0, n)

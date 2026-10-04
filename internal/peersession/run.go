@@ -52,10 +52,9 @@ func (c *Conn) Run(ctx context.Context, sink Sink) (err error) {
 		c.lastTx = now
 	}
 	if c.opts.RequestResync {
-		if err := c.sendControl(ctx, peerwire.ControlResyncRequest); err != nil {
+		if err := c.requestResync(ctx); err != nil {
 			return err
 		}
-		c.setLearn(LearnRequested)
 	}
 	if c.opts.Output != nil {
 		defer c.watchOutput(ctx)()
@@ -84,14 +83,33 @@ func (c *Conn) Run(ctx context.Context, sink Sink) (err error) {
 		if err := c.tick(ctx, time.Now()); err != nil {
 			return err
 		}
+		if !c.resyncAt.IsZero() && !time.Now().Before(c.resyncAt) {
+			if err := c.requestResync(ctx); err != nil {
+				return err
+			}
+		}
 		next := minTime(c.lastRx.Add(c.opts.IdleTimeout), c.lastTx.Add(c.opts.Heartbeat))
 		if !c.refreshAt.IsZero() {
 			next = minTime(next, c.refreshAt)
+		}
+		if !c.resyncAt.IsZero() {
+			next = minTime(next, c.resyncAt)
 		}
 		if err := c.fill(ctx, next); err != nil && !errors.Is(err, errDeadline) {
 			return err
 		}
 	}
+}
+
+// requestResync asks the source to teach every table it shares.
+func (c *Conn) requestResync(ctx context.Context) error {
+	c.resyncAt = time.Time{}
+	if err := c.sendControl(ctx, peerwire.ControlResyncRequest); err != nil {
+		return err
+	}
+	c.setLearn(LearnRequested)
+	c.resyncRequests.Add(1)
+	return nil
 }
 
 // fail sends the error message a protocol failure calls for, best effort,
@@ -153,7 +171,7 @@ func (c *Conn) process(ctx context.Context, sink Sink) error {
 		// read that delivered it: a burst buffered behind a slow sink must
 		// not make a live source look idle.
 		c.lastRx = time.Now()
-		c.lastRxNano.Store(c.rxTime.UnixNano())
+		c.lastRxMono.Store(int64(c.rxTime.Sub(monoBase)))
 		c.rxMessages.Add(1)
 		if err := c.handle(ctx, f, sink); err != nil {
 			return err
@@ -175,7 +193,7 @@ func (c *Conn) handle(ctx context.Context, f peerwire.Frame, sink Sink) error {
 	}
 	msg, err := c.in.Decode(f, c.rxTime)
 	if err != nil {
-		return c.decodeError(ctx, f, err)
+		return c.decodeError(ctx, f, err, sink)
 	}
 	switch m := msg.(type) {
 	case peermsg.Control:
@@ -195,13 +213,13 @@ func (c *Conn) handle(ctx context.Context, f peerwire.Frame, sink Sink) error {
 	}
 }
 
-func (c *Conn) decodeError(ctx context.Context, f peerwire.Frame, err error) error {
+func (c *Conn) decodeError(ctx context.Context, f peerwire.Frame, err error, sink Sink) error {
 	switch {
 	case errors.Is(err, peermsg.ErrSchema):
 		// Inbound bound the rejected definition and selected it.
 		id, _ := c.in.Selected()
 		t, _ := c.in.Table(id)
-		return c.define(ctx, id, t.Definition, err, nil)
+		return c.define(ctx, id, t.Definition, err, sink)
 	case errors.Is(err, peermsg.ErrTooManyTables):
 		return wrapCause(ErrLimit, err, "table definition")
 	case errors.Is(err, peermsg.ErrUnknownMessage):
@@ -227,10 +245,16 @@ func (c *Conn) define(ctx context.Context, id peermsg.RemoteTableID, def peermsg
 	kind := kindIgnored
 	if spec, ok := c.opts.Tables[def.Name]; ok {
 		kind = kindInput
+		var err error
 		if rejected != nil {
-			return wrapCause(ErrSchema, rejected, "input table %s", def.Name)
+			err = wrapCause(ErrSchema, rejected, "input table %s", def.Name)
+		} else {
+			err = checkSpec(def, spec)
 		}
-		if err := checkSpec(def, spec); err != nil {
+		if err != nil {
+			// Best effort: the session ends with err whether or not
+			// the sink takes the report.
+			_ = sink(ctx, TableRejected{ID: id, Table: def.Name, Err: err, Received: c.rxTime})
 			return err
 		}
 	} else if out := c.outNames[def.Name]; out != nil {
@@ -378,6 +402,9 @@ func (c *Conn) control(ctx context.Context, typ peerwire.MessageType, sink Sink)
 		}
 		if err := sink(ctx, SyncFinished{Partial: partial, Received: c.rxTime}); err != nil {
 			return wrapCause(ErrEventRejected, err, "resync reply")
+		}
+		if partial && c.opts.ResyncRetry > 0 {
+			c.resyncAt = time.Now().Add(c.opts.ResyncRetry)
 		}
 		return nil
 	default:
