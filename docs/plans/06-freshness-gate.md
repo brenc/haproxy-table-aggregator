@@ -53,4 +53,10 @@ Proceed to the aggregation engine only after this gate has a supported design.
 - Commands and versions: not run.
 - Acceptance evidence: none yet.
 - Decisions or deviations: none.
+- Carried in from phase 04 review: the session idle timer counts from when
+  a message is processed, not read, so a source that dies right after a
+  burst is detected late by the time a slow consumer takes to drain the
+  backlog: up to the number of backlogged messages (the decoder buffer
+  plus the kernel socket receive buffer) times `event_timeout`. Account
+  for this delay in the freshness bound or bound it here.
 - Remaining work / next action: start after phase 05.

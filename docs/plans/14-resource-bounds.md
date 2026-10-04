@@ -51,4 +51,13 @@ the unresolved tradeoff rather than deleting the guardrail.
 - Commands and versions: not run.
 - Acceptance evidence: none yet.
 - Decisions or deviations: none.
+- Carried in from phase 04 review:
+  - Any local process can hold all 64 pending inbound handshake slots
+    (`maxPendingInbound` in `internal/sources`) for the full
+    `handshake_timeout`, delaying real HAProxy sessions. Bound this per
+    remote address or revisit it once phase 13 adds mutual TLS.
+  - When the event queue stays full, a session that failed with
+    `ErrQueueFull` keeps its source slot until its `SessionDown` is
+    queued, so no new session starts until the consumer drains. Bound
+    that wait without breaking per-source lifecycle ordering.
 - Remaining work / next action: start after phase 13.

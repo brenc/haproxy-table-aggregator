@@ -46,4 +46,8 @@ evidence to support the qualification phases and later monitoring integration.
 - Commands and versions: not run.
 - Acceptance evidence: none yet.
 - Decisions or deviations: none.
+- Carried in from phase 04 review: `sources.Manager.Status` can report a
+  session number that never produced a `SessionUp` event, and reports a
+  session as up while it waits on a full queue to emit `SessionDown`
+  after its socket closed. Make status reflect the delivered lifecycle.
 - Remaining work / next action: start after phase 14.
