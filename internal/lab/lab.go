@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,6 +57,29 @@ type Options struct {
 	BaseDir string
 	// Nodes names the HAProxy processes. Empty means DefaultNodes.
 	Nodes []string
+	// Aggregator, if non-nil, gives every node a peers section shared
+	// only with the aggregator, attached to all three tables.
+	Aggregator *Aggregator
+}
+
+// Aggregator describes the aggregator peer the lab nodes are configured
+// with. Each node's own peer name is its node name.
+type Aggregator struct {
+	// Name is the aggregator's peer name.
+	Name string
+	// Addr is the address every node dials to reach the aggregator: a
+	// loopback ip:port, since lab peers sessions are plaintext.
+	Addr string
+	// NodeAddrs overrides Addr per node name. A loopback address nothing
+	// listens on keeps a node from ever dialing the aggregator itself.
+	NodeAddrs map[string]string
+}
+
+func (a *Aggregator) addr(node string) string {
+	if v, ok := a.NodeAddrs[node]; ok {
+		return v
+	}
+	return a.Addr
 }
 
 // Lab is a running set of independent HAProxy nodes sharing one responder.
@@ -90,6 +114,9 @@ type Node struct {
 	// ProdAddr6 is the production-style listener on [::1], or empty when
 	// IPv6 loopback is unavailable on this host.
 	ProdAddr6 string
+	// PeersAddr is the node's peers bind (127.0.0.1:port) when the lab has
+	// an aggregator, or empty.
+	PeersAddr string
 	// Listeners are the listener addresses of a custom node (see
 	// StartCustom), in CustomOptions order. The lab listener fields above
 	// are empty for a custom node.
@@ -126,6 +153,11 @@ func Start(ctx context.Context, opts Options) (_ *Lab, err error) {
 	if err = validateNodeNames(nodes); err != nil {
 		return nil, err
 	}
+	if agg := opts.Aggregator; agg != nil {
+		if err = validateAggregator(agg, nodes); err != nil {
+			return nil, err
+		}
+	}
 	record, err := NewRunRecord(ctx, opts.HAProxy, opts.Period)
 	if err != nil {
 		return nil, err
@@ -150,7 +182,7 @@ func Start(ctx context.Context, opts Options) (_ *Lab, err error) {
 		return nil, err
 	}
 	for _, name := range nodes {
-		n, startErr := l.startNode(ctx, record.HAProxyPath, name)
+		n, startErr := l.startNode(ctx, record.HAProxyPath, name, opts.Aggregator)
 		if n != nil {
 			l.Nodes = append(l.Nodes, n)
 		}
@@ -168,6 +200,23 @@ func validateNodeNames(names []string) error {
 		}
 		if slices.Contains(names[:i], name) {
 			return fmt.Errorf("lab: duplicate node name %q", name)
+		}
+	}
+	return nil
+}
+
+func validateAggregator(agg *Aggregator, nodes []string) error {
+	if agg.Name == "" || strings.ContainsAny(agg.Name, " \t\r\n#") {
+		return fmt.Errorf("lab: aggregator peer name %q is not a plain word", agg.Name)
+	}
+	if slices.Contains(nodes, agg.Name) {
+		return fmt.Errorf("lab: aggregator peer name %q is also a node name", agg.Name)
+	}
+	for _, name := range nodes {
+		// Lab peers sessions are plaintext, so they stay on loopback.
+		ap, err := netip.ParseAddrPort(agg.addr(name))
+		if err != nil || !ap.Addr().IsLoopback() || ap.Addr().Zone() != "" || ap.Port() == 0 {
+			return fmt.Errorf("lab: aggregator address %q for node %s must be a loopback ip:port", agg.addr(name), name)
 		}
 	}
 	return nil
@@ -224,7 +273,7 @@ func listenInherited(ctx context.Context, network, address string) (inheritedLis
 	return inheritedListener{addr: ln.Addr().String(), file: f}, nil
 }
 
-func (l *Lab) startNode(ctx context.Context, haproxy, name string) (*Node, error) {
+func (l *Lab) startNode(ctx context.Context, haproxy, name string, agg *Aggregator) (*Node, error) {
 	n := &Node{
 		Name:       name,
 		Socket:     filepath.Join(l.Dir, name+".sock"),
@@ -272,6 +321,13 @@ func (l *Lab) startNode(ctx context.Context, haproxy, name string) (*Node, error
 		prod6 = ""
 	}
 	n.LabAddr, n.ProdAddr4, n.ProdAddr6, n.ProxyAddr = labAddr, prod4, prod6, proxyAddr
+	var aggName, aggAddr, peersBind string
+	if agg != nil {
+		if n.PeersAddr, peersBind, err = inherit("tcp4", "127.0.0.1:0"); err != nil {
+			return nil, fmt.Errorf("lab: node %s peers listener: %w", name, err)
+		}
+		aggName, aggAddr = agg.Name, agg.addr(name)
+	}
 
 	cfg, err := renderConfig(configParams{
 		Node:        name,
@@ -290,6 +346,9 @@ func (l *Lab) startNode(ctx context.Context, haproxy, name string) (*Node, error
 		ListenerHdr: ListenerHeader,
 		KeyHdr:      KeyHeader,
 		LookupHdr:   LookupHeader,
+		AggName:     aggName,
+		AggAddr:     aggAddr,
+		PeersBind:   peersBind,
 	})
 	if err != nil {
 		return nil, err
@@ -407,7 +466,7 @@ func (n *Node) ShowTable(ctx context.Context, table string) (Table, error) {
 // Addrs returns every listener address the node owns.
 func (n *Node) Addrs() []string {
 	var addrs []string
-	for _, a := range []string{n.LabAddr, n.ProdAddr4, n.ProxyAddr, n.ProdAddr6} {
+	for _, a := range []string{n.LabAddr, n.ProdAddr4, n.ProxyAddr, n.ProdAddr6, n.PeersAddr} {
 		if a != "" {
 			addrs = append(addrs, a)
 		}
