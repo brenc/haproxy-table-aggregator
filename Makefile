@@ -92,13 +92,14 @@ lab-smoke:
 
 # Runs the lab integration tests (race detector on) against each pinned
 # build, recording each run's Go/HAProxy identity in artifacts/lab-runs.
-# This includes the live peers-protocol captures in internal/peerwire.
+# This includes the live peers-protocol captures in internal/peerwire and
+# the daemon's live session tests in internal/sources and cmd/htad.
 lab-test:
 	@set -e; for v in $(HAPROXY_VERSIONS); do \
 		echo "lab-test haproxy $$v"; \
 		HTA_HAPROXY=$(CURDIR)/artifacts/haproxy/$$v/haproxy \
 		HTA_HAPROXY_VERSION=$$v HTA_LAB_RECORD_DIR=$(LAB_RECORD_DIR) \
-		$(GO) test -race -count=1 -v ./internal/...; \
+		$(GO) test -race -count=1 -timeout 15m -v ./internal/... ./cmd/...; \
 	done
 
 # Regenerates the committed peers-protocol capture fixtures (framing in
