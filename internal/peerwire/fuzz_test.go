@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/brenc/haproxy-table-aggregator/internal/peerwire"
+	"github.com/brenc/haproxy-table-aggregator/internal/peerwire/peertest"
 )
 
 var maxUint64 = new(big.Int).SetUint64(^uint64(0))
@@ -202,13 +203,13 @@ func captureStreams(tb testing.TB) []seedStream {
 		if err != nil {
 			tb.Fatal(err)
 		}
-		c, err := parseCapture(f)
+		c, err := peertest.Parse(f)
 		_ = f.Close()
 		if err != nil {
 			tb.Fatalf("%s: %v", p, err)
 		}
-		cc := captureCases[c.get("case")]
-		out = append(out, seedStream{c.stream("rx"), cc.rxLines}, seedStream{c.stream("tx"), cc.txLines})
+		cc := captureCases[c.Get("case")]
+		out = append(out, seedStream{c.Stream(peertest.KindRx), cc.rxLines}, seedStream{c.Stream(peertest.KindTx), cc.txLines})
 	}
 	return out
 }

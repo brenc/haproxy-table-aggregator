@@ -1,11 +1,8 @@
 package peerwire_test
 
 import (
-	"bufio"
 	"bytes"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"os"
@@ -16,179 +13,15 @@ import (
 	"testing"
 
 	"github.com/brenc/haproxy-table-aggregator/internal/peerwire"
+	"github.com/brenc/haproxy-table-aggregator/internal/peerwire/peertest"
 )
 
-// Capture fixtures record one TCP connection between stock HAProxy and a
-// test peer. They are written only by TestLiveCapture (see
-// capture_live_test.go) and are never edited by hand. Format, one item per
-// line:
-//
-//	# comment                 ignored
-//	@key value                metadata
-//	rx <hex>                  bytes received from HAProxy, in order
-//	tx <hex>                  bytes sent to HAProxy, in order
-//	txz <n>                   n zero bytes sent to HAProxy
-//	note <text>               an action taken at this point (runtime
-//	                          command, read deadline, ...)
-//
-// The rx and tx streams are the concatenation of their lines.
-const (
-	captureFormat = "peerwire-capture/1"
-	captureDir    = "testdata/captures"
-	hexPerLine    = 32
-	zeroRunMin    = 64
-	maxZeroRun    = 1 << 20
-)
+// Capture fixtures (format: package peertest) are written only by
+// TestLiveCapture (see capture_live_test.go) and are never edited by hand.
+const captureDir = "testdata/captures"
 
 // Versions with committed fixtures. Each must have every case.
 var captureVersions = []string{"3.4.6", "3.2.25"}
-
-type captureItem struct {
-	kind string // "rx", "tx", or "note"
-	data []byte
-	text string
-}
-
-type capture struct {
-	meta  [][2]string
-	items []captureItem
-}
-
-func (c *capture) set(key, value string) {
-	for i := range c.meta {
-		if c.meta[i][0] == key {
-			c.meta[i][1] = value
-			return
-		}
-	}
-	c.meta = append(c.meta, [2]string{key, value})
-}
-
-func (c *capture) get(key string) string {
-	for _, kv := range c.meta {
-		if kv[0] == key {
-			return kv[1]
-		}
-	}
-	return ""
-}
-
-func (c *capture) add(kind string, data []byte) {
-	if len(data) == 0 {
-		return
-	}
-	c.items = append(c.items, captureItem{kind: kind, data: bytes.Clone(data)})
-}
-
-func (c *capture) note(format string, args ...any) {
-	c.items = append(c.items, captureItem{kind: "note", text: fmt.Sprintf(format, args...)})
-}
-
-func (c *capture) stream(kind string) []byte {
-	var b []byte
-	for _, it := range c.items {
-		if it.kind == kind {
-			b = append(b, it.data...)
-		}
-	}
-	return b
-}
-
-// trimRx drops received bytes past n, which a reader may have buffered
-// beyond the last complete frame before closing.
-func (c *capture) trimRx(n int) int {
-	total := len(c.stream("rx"))
-	excess := total - n
-	dropped := excess
-	for i := len(c.items) - 1; i >= 0 && excess > 0; i-- {
-		if c.items[i].kind != "rx" {
-			continue
-		}
-		k := min(excess, len(c.items[i].data))
-		c.items[i].data = c.items[i].data[:len(c.items[i].data)-k]
-		excess -= k
-	}
-	c.items = slices.DeleteFunc(c.items, func(it captureItem) bool { return it.kind != "note" && len(it.data) == 0 })
-	return max(dropped, 0)
-}
-
-func (c *capture) encode(comments []string) []byte {
-	var b bytes.Buffer
-	for _, line := range comments {
-		b.WriteString(strings.TrimRight("# "+line, " ") + "\n")
-	}
-	for _, kv := range c.meta {
-		fmt.Fprintf(&b, "@%s %s\n", kv[0], kv[1])
-	}
-	for _, it := range c.items {
-		if it.kind == "note" {
-			fmt.Fprintf(&b, "note %s\n", it.text)
-			continue
-		}
-		data := it.data
-		for len(data) > 0 {
-			if it.kind == "tx" {
-				z := 0
-				for z < len(data) && data[z] == 0 {
-					z++
-				}
-				if z >= zeroRunMin {
-					fmt.Fprintf(&b, "txz %d\n", z)
-					data = data[z:]
-					continue
-				}
-			}
-			n := min(len(data), hexPerLine)
-			if it.kind == "tx" {
-				if i := bytes.Index(data[:n], make([]byte, zeroRunMin)); i > 0 {
-					n = i
-				}
-			}
-			fmt.Fprintf(&b, "%s %s\n", it.kind, hex.EncodeToString(data[:n]))
-			data = data[n:]
-		}
-	}
-	return b.Bytes()
-}
-
-func parseCapture(r io.Reader) (*capture, error) {
-	c := &capture{}
-	sc := bufio.NewScanner(r)
-	for n := 1; sc.Scan(); n++ {
-		line := sc.Text()
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		kind, rest, _ := strings.Cut(line, " ")
-		switch {
-		case strings.HasPrefix(kind, "@"):
-			c.meta = append(c.meta, [2]string{kind[1:], rest})
-		case kind == "rx" || kind == "tx":
-			b, err := hex.DecodeString(rest)
-			if err != nil || len(b) == 0 {
-				return nil, fmt.Errorf("line %d: bad hex", n)
-			}
-			c.items = append(c.items, captureItem{kind: kind, data: b})
-		case kind == "txz":
-			z, err := strconv.Atoi(rest)
-			if err != nil || z <= 0 || z > maxZeroRun {
-				return nil, fmt.Errorf("line %d: bad zero run %q", n, rest)
-			}
-			c.items = append(c.items, captureItem{kind: "tx", data: make([]byte, z)})
-		case kind == "note":
-			c.items = append(c.items, captureItem{kind: "note", text: rest})
-		default:
-			return nil, fmt.Errorf("line %d: unknown item %q", n, kind)
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	if got := c.get("format"); got != captureFormat {
-		return nil, fmt.Errorf("format %q, want %q", got, captureFormat)
-	}
-	return c, nil
-}
 
 // Boundary values the live capture stores through the runtime API, keyed
 // by integer stick-table key (index + 1). Expected bytes come from
@@ -265,11 +98,11 @@ func TestCaptureFixtures(t *testing.T) {
 					t.Fatalf("fixture missing; regenerate with `make peerwire-captures`: %v", err)
 				}
 				defer func() { _ = f.Close() }()
-				c, err := parseCapture(f)
+				c, err := peertest.Parse(f)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if got := c.get("haproxy-version"); !strings.HasPrefix(got, v+"-") && got != v {
+				if got := c.Get("haproxy-version"); !strings.HasPrefix(got, v+"-") && got != v {
 					t.Fatalf("fixture records haproxy %q", got)
 				}
 				verifyCapture(t, c)
@@ -280,15 +113,15 @@ func TestCaptureFixtures(t *testing.T) {
 
 // verifyCapture frames both streams of c under every chunking and checks
 // the case's expectations. It is shared by fixture replay and live runs.
-func verifyCapture(t *testing.T, c *capture) {
+func verifyCapture(t *testing.T, c *peertest.Capture) {
 	t.Helper()
-	name := c.get("case")
+	name := c.Get("case")
 	cc, ok := captureCases[name]
 	if !ok {
 		t.Fatalf("unknown case %q", name)
 	}
-	rx := frameEverySplit(t, "rx", c.stream("rx"), cc.rxLines)
-	tx := frameEverySplit(t, "tx", c.stream("tx"), cc.txLines)
+	rx := frameEverySplit(t, "rx", c.Stream(peertest.KindRx), cc.rxLines)
+	tx := frameEverySplit(t, "tx", c.Stream(peertest.KindTx), cc.txLines)
 	if !errors.Is(rx.err, io.EOF) {
 		t.Fatalf("rx stream: %v, want a clean end", rx.err)
 	}
@@ -308,7 +141,7 @@ func verifyCapture(t *testing.T, c *capture) {
 		checkHello(t, tx.events, "hap", "agg", 0)
 	}
 	if cc.rxLines == 3 {
-		pid, err := strconv.ParseUint(c.get("haproxy-pid"), 10, 32)
+		pid, err := strconv.ParseUint(c.Get("haproxy-pid"), 10, 32)
 		if err != nil {
 			t.Fatalf("haproxy-pid: %v", err)
 		}
