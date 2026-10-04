@@ -28,8 +28,9 @@
 // Output tables are optional; their layout is fixed by package output.
 // Each must match the source's own stick table of that name (gpt(4) and
 // the same expire), no output name may be an input table name, a
-// metadata table expires after at most output.MaxLease, and outputs need
-// request_resync (the default).
+// metadata table expires after at most output.MaxLease. request_resync
+// may only be true (the default): a source becomes ready only after a
+// complete resync.
 package config
 
 import (
@@ -147,7 +148,8 @@ type Config struct {
 	MaxSessionTables int
 	// RequestResync makes each new session ask its source for a full
 	// resynchronization. A source becomes ready only after a complete
-	// one, so without it no source is ever ready.
+	// one, so Validate refuses false; the field stays so a Config built
+	// directly (in tests) can still exercise sessions without it.
 	RequestResync bool
 	// HealthTimeout is the source-health bound: a source is healthy only
 	// while its session's last processed message was read less than this
@@ -562,9 +564,9 @@ func (c *Config) setTiming(f File) error {
 		return invalid("max_source_entries: %d is outside 1..%d", c.MaxSourceEntries, MaxMaxSourceEntries)
 	}
 	c.RequestResync = f.RequestResync == nil || *f.RequestResync
-	if len(c.Outputs) > 0 && !c.RequestResync {
-		return invalid("request_resync: outputs need it; a source announces its output tables, which the " +
-			"daemon waits for before writing them, only when it teaches")
+	if !c.RequestResync {
+		return invalid("request_resync: must be true; a source becomes ready only after a complete resync, " +
+			"and announces its output tables only when it teaches")
 	}
 	return nil
 }

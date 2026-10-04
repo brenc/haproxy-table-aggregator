@@ -139,6 +139,7 @@ func TestInvalid(t *testing.T) {
 		"output expire sub-ms":     edit(`"expire": "30s"`, `"expire": "1500us"`),
 		"more tables than session": addField(`"max_session_tables": 2`),
 		"outputs without resync":   addField(`"request_resync": false`),
+		"resync off, no outputs":   strings.Split(example, ",\n  \"outputs\"")[0] + `, "request_resync": false}`,
 		"short health timeout":     addField(`"health_timeout": "3s"`),
 		"long health timeout":      addField(`"health_timeout": "9s"`),
 		"no source entries":        addField(`"max_source_entries": 0`),
@@ -173,7 +174,7 @@ func TestValidVariants(t *testing.T) {
 			`{"name": "a"}`, `{"name": "a", "address": "127.0.0.2:1"}`, 1),
 		"no outputs": strings.Split(example, ",\n  \"outputs\"")[0] + "\n}",
 		"timing set": strings.Replace(strings.Split(example, ",\n  \"outputs\"")[0]+"\n}", `"local_peer": "agg",`,
-			`"local_peer": "agg", "heartbeat": "1s", "idle_timeout": "4s", "event_timeout": "500ms", "request_resync": false, `+
+			`"local_peer": "agg", "heartbeat": "1s", "idle_timeout": "4s", "event_timeout": "500ms", "request_resync": true, `+
 				`"health_timeout": "4s", "max_source_entries": 10,`, 1),
 	}
 	for name, doc := range cases {
@@ -182,7 +183,7 @@ func TestValidVariants(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if name == "timing set" && (c.Heartbeat != time.Second || c.RequestResync ||
+			if name == "timing set" && (c.Heartbeat != time.Second || !c.RequestResync ||
 				c.HealthTimeout != 4*time.Second || c.MaxSourceEntries != 10) {
 				t.Fatalf("%+v", c)
 			}

@@ -189,8 +189,8 @@ qualification belong to phase 11, using this state model.
   - htad applies events to a store and every 250 ms observes session
     liveness, expires entries, and logs source state changes and roster
     readiness (`TestRunEvents` waits for "roster ready").
-  - `request_resync: false` is still accepted, but then no source ever
-    becomes Ready.
+  - `request_resync: false` is refused by config (owner decision after
+    review): without a resync no source can ever become Ready.
 - Handoff to later phases: keys absent from a later session's complete
   snapshot keep the earlier session's value until expiry (tagged with its
   session); reconciling them, and reconnect/restart qualification, are
