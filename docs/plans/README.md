@@ -5,7 +5,7 @@
 - [x] [00 — Development tooling](00-dev-tooling.md)
 - [x] [01 — Reproducible local lab](01-local-lab.md)
 - [x] [02 — Wire framing and integers](02-wire-framing.md)
-- [ ] [03 — Table and entry messages](03-table-messages.md)
+- [x] [03 — Table and entry messages](03-table-messages.md)
 - [ ] [04 — Peer sessions](04-peer-sessions.md)
 - [ ] [05 — Output tables and isolation](05-output-isolation.md)
 - [ ] [06 — Freshness feasibility gate](06-freshness-gate.md)
