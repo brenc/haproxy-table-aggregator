@@ -267,8 +267,11 @@ Rules the following phases rely on:
   - The capture format and driver moved to `internal/peerwire/peertest`;
     `make peerwire-captures` now regenerates both packages' fixtures.
 - Findings for later phases:
-  - Upstream defect (3.4.6 only, minimal reproduction in the `push`
-    fixture): every implicit update ID is recorded as
+  - Upstream defect (of the pinned builds, 3.4.6 only; by source every
+    release since 3.3.0, from upstream `f12252c7a`; minimal reproduction
+    in the `push` fixture; draft upstream report in
+    [`docs/upstream/peers-implicit-update-id.md`](../upstream/peers-implicit-update-id.md)):
+    every implicit update ID is recorded as
     `htonl(last_get + 1)` (`peer_treat_updatemsg`), so on a little-endian
     host each one is recorded and acknowledged byte-swapped, and the next
     implicit ID is derived from the swapped value. In the fixture the
