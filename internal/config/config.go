@@ -1,7 +1,7 @@
 // Package config loads and validates the aggregator daemon's configuration:
 // a strict JSON document naming the local peer identity, the optional
-// listen address, the explicit source peers, the input tables, and session
-// timing. Nothing is discovered from the environment.
+// listen address, the explicit source peers, the input tables, the output
+// tables, and session timing. Nothing is discovered from the environment.
 //
 // Until mutual TLS exists (phase 13), every peers session is plaintext, so a
 // configuration is accepted only when it sets the explicit isolated-lab
@@ -18,8 +18,17 @@
 //	    {"name": "a"},
 //	    {"name": "b", "address": "127.0.0.1:10001"}
 //	  ],
-//	  "tables": [{"name": "lab_in", "period": "10s"}]
+//	  "tables": [{"name": "lab_in", "period": "10s"}],
+//	  "outputs": [
+//	    {"name": "lab_out", "kind": "aggregate", "expire": "30s"},
+//	    {"name": "lab_meta", "kind": "metadata", "expire": "30s"}
+//	  ]
 //	}
+//
+// Output tables are optional; their layout is fixed by package output.
+// Each must match the source's own stick table of that name (gpt(4) and
+// the same expire), no output name may be an input table name, and
+// outputs need request_resync (the default).
 package config
 
 import (
@@ -37,6 +46,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/brenc/haproxy-table-aggregator/internal/output"
 	"github.com/brenc/haproxy-table-aggregator/internal/peermsg"
 	"github.com/brenc/haproxy-table-aggregator/internal/peerwire"
 )
@@ -97,6 +107,10 @@ type Config struct {
 	Sources []Source
 	// Tables are the input tables, in file order.
 	Tables []Table
+	// Outputs are the output tables, in file order, which is the order
+	// sessions announce them in. Their names differ from every input
+	// table's.
+	Outputs []Output
 	// Heartbeat is the longest the daemon stays silent on a session.
 	Heartbeat time.Duration
 	// IdleTimeout fails a session after this long without a complete
@@ -115,7 +129,7 @@ type Config struct {
 	EventTimeout time.Duration
 	// MaxSessionTables bounds the table IDs one session may bind: every
 	// table the source shares with this peer counts, input or not, so it
-	// is at least the number of input tables.
+	// is at least the number of input and output tables.
 	MaxSessionTables int
 	// RequestResync makes each new session ask its source for a full
 	// resynchronization.
@@ -139,6 +153,31 @@ type Table struct {
 	Name string
 	// Period is the http_req_rate period the table must announce.
 	Period time.Duration
+}
+
+// Output is one output table the daemon publishes to every source.
+type Output struct {
+	// Name is the stick-table name.
+	Name string
+	// Kind fixes the slot layout (see package output).
+	Kind output.Kind
+	// Expire is the source table's configured expire, whole
+	// milliseconds from 1ms to MaxExpire.
+	Expire time.Duration
+}
+
+// MaxExpire is the largest output table expire: HAProxy stores table
+// expiry as a signed 32-bit millisecond count.
+const MaxExpire = time.Duration(peermsg.MaxRemaining) * time.Millisecond
+
+// OutputTables returns the outputs as package output configures them.
+func (c *Config) OutputTables() []output.Table {
+	out := make([]output.Table, 0, len(c.Outputs))
+	for _, o := range c.Outputs {
+		//nolint:gosec // G115: Validate bounds Expire to MaxExpire, below 2^31 ms.
+		out = append(out, output.Table{Name: o.Name, Kind: o.Kind, Expiry: peermsg.Millis(o.Expire.Milliseconds())})
+	}
+	return out
 }
 
 // Source returns the configured source with the given name.
@@ -175,6 +214,7 @@ type File struct {
 	Listen                       string       `json:"listen"`
 	Sources                      []FileSource `json:"sources"`
 	Tables                       []FileTable  `json:"tables"`
+	Outputs                      []FileOutput `json:"outputs"`
 	Heartbeat                    *Duration    `json:"heartbeat"`
 	IdleTimeout                  *Duration    `json:"idle_timeout"`
 	HandshakeTimeout             *Duration    `json:"handshake_timeout"`
@@ -196,6 +236,13 @@ type FileSource struct {
 type FileTable struct {
 	Name   string    `json:"name"`
 	Period *Duration `json:"period"`
+}
+
+// FileOutput is one entry of File.Outputs.
+type FileOutput struct {
+	Name   string    `json:"name"`
+	Kind   string    `json:"kind"`
+	Expire *Duration `json:"expire"`
 }
 
 // Load reads and validates the configuration file at path.
@@ -320,6 +367,9 @@ func (f File) Validate() (Config, error) {
 	if err := c.addTables(f.Tables); err != nil {
 		return Config{}, err
 	}
+	if err := c.addOutputs(f.Outputs); err != nil {
+		return Config{}, err
+	}
 	if err := c.setTiming(f); err != nil {
 		return Config{}, err
 	}
@@ -379,6 +429,39 @@ func (c *Config) addTables(tables []FileTable) error {
 	return nil
 }
 
+func (c *Config) addOutputs(outputs []FileOutput) error {
+	if len(outputs) > MaxTables {
+		return invalid("outputs: at most %d output tables, have %d", MaxTables, len(outputs))
+	}
+	seen := map[string]bool{}
+	for _, t := range c.Tables {
+		seen[t.Name] = true
+	}
+	for i, o := range outputs {
+		if err := (peermsg.Definition{Name: o.Name, KeyType: peermsg.KeyTypeIPv6, Expiry: 1}).Validate(); err != nil {
+			return invalid("outputs[%d].name: %v", i, err)
+		}
+		if seen[o.Name] {
+			return invalid("outputs[%d].name: %q is already an input or output table; the aggregator never "+
+				"writes input tables", i, o.Name)
+		}
+		seen[o.Name] = true
+		kind, err := output.ParseKind(o.Kind)
+		if err != nil {
+			return invalid("outputs[%d].kind: %v", i, err)
+		}
+		if o.Expire == nil {
+			return invalid("outputs[%d].expire: required; it must equal the HAProxy table's expire", i)
+		}
+		e := time.Duration(*o.Expire)
+		if e < time.Millisecond || e%time.Millisecond != 0 || e > MaxExpire {
+			return invalid("outputs[%d].expire: %v must be whole milliseconds from 1ms to %v", i, e, MaxExpire)
+		}
+		c.Outputs = append(c.Outputs, Output{Name: o.Name, Kind: kind, Expire: e})
+	}
+	return nil
+}
+
 func durationOr(d *Duration, def time.Duration) time.Duration {
 	if d == nil {
 		return def
@@ -433,11 +516,15 @@ func (c *Config) setTiming(f File) error {
 	if c.MaxSessionTables < 1 || c.MaxSessionTables > peermsg.MaxTables {
 		return invalid("max_session_tables: %d is outside 1..%d", c.MaxSessionTables, peermsg.MaxTables)
 	}
-	if c.MaxSessionTables < len(c.Tables) {
-		return invalid("max_session_tables %d is below the %d configured input tables; every table a source "+
-			"shares in a session counts, input or not", c.MaxSessionTables, len(c.Tables))
+	if n := len(c.Tables) + len(c.Outputs); c.MaxSessionTables < n {
+		return invalid("max_session_tables %d is below the %d configured input and output tables; every table a "+
+			"source shares in a session counts, input or not", c.MaxSessionTables, n)
 	}
 	c.RequestResync = f.RequestResync == nil || *f.RequestResync
+	if len(c.Outputs) > 0 && !c.RequestResync {
+		return invalid("request_resync: outputs need it; a source announces its output tables, which the " +
+			"daemon waits for before writing them, only when it teaches")
+	}
 	return nil
 }
 

@@ -4,11 +4,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/brenc/haproxy-table-aggregator/internal/config"
+	"github.com/brenc/haproxy-table-aggregator/internal/output"
 )
 
 const example = `{
@@ -19,7 +21,11 @@ const example = `{
     {"name": "a"},
     {"name": "b", "address": "127.0.0.1:10001"}
   ],
-  "tables": [{"name": "lab_in", "period": "10s"}]
+  "tables": [{"name": "lab_in", "period": "10s"}],
+  "outputs": [
+    {"name": "lab_out", "kind": "aggregate", "expire": "30s"},
+    {"name": "lab_meta", "kind": "metadata", "expire": "30s"}
+  ]
 }`
 
 func TestExampleAndDefaults(t *testing.T) {
@@ -41,6 +47,13 @@ func TestExampleAndDefaults(t *testing.T) {
 	}
 	if s, ok := c.Source("b"); !ok || s.Address == "" {
 		t.Fatal("Source lookup")
+	}
+	want := []output.Table{
+		{Name: "lab_out", Kind: output.KindAggregate, Expiry: 30000},
+		{Name: "lab_meta", Kind: output.KindMetadata, Expiry: 30000},
+	}
+	if got := c.OutputTables(); !slices.Equal(got, want) {
+		t.Fatalf("output tables %+v, want %+v", got, want)
 	}
 }
 
@@ -114,6 +127,16 @@ func TestInvalid(t *testing.T) {
 		"case-folded key":          edit(`"insecure_plaintext_loopback_lab"`, `"Insecure_Plaintext_Loopback_Lab"`),
 		"case-folded nested key":   edit(`{"name": "a"}`, `{"NAME": "a"}`),
 		"duplicate nested key":     edit(`{"name": "a"}`, `{"name": "a", "name": "c"}`),
+		"output named like input":  edit(`"name": "lab_out"`, `"name": "lab_in"`),
+		"duplicate output":         edit(`"name": "lab_meta"`, `"name": "lab_out"`),
+		"bad output name":          edit(`"name": "lab_out"`, `"name": "lab out"`),
+		"unknown output kind":      edit(`"kind": "metadata"`, `"kind": "readiness"`),
+		"output without kind":      edit(`"kind": "metadata", `, ``),
+		"output without expire":    edit(`, "expire": "30s"}`, `}`),
+		"output expire too long":   edit(`"expire": "30s"`, `"expire": "600h"`),
+		"output expire sub-ms":     edit(`"expire": "30s"`, `"expire": "1500us"`),
+		"more tables than session": addField(`"max_session_tables": 2`),
+		"outputs without resync":   addField(`"request_resync": false`),
 		"more inputs than session": edit(`[{"name": "lab_in", "period": "10s"}]`,
 			`[{"name": "x", "period": "1s"}, {"name": "y", "period": "1s"}], "max_session_tables": 1`),
 	}
@@ -142,7 +165,8 @@ func TestValidVariants(t *testing.T) {
 		"ephemeral listen": strings.Replace(example, `"127.0.0.1:10000"`, `"127.0.0.1:0"`, 1),
 		"outbound only": strings.Replace(strings.Replace(example, `"listen": "127.0.0.1:10000",`, ``, 1),
 			`{"name": "a"}`, `{"name": "a", "address": "127.0.0.2:1"}`, 1),
-		"timing set": strings.Replace(example, `"local_peer": "agg",`,
+		"no outputs": strings.Split(example, ",\n  \"outputs\"")[0] + "\n}",
+		"timing set": strings.Replace(strings.Split(example, ",\n  \"outputs\"")[0]+"\n}", `"local_peer": "agg",`,
 			`"local_peer": "agg", "heartbeat": "1s", "idle_timeout": "4s", "event_timeout": "500ms", "request_resync": false,`, 1),
 	}
 	for name, doc := range cases {
@@ -153,6 +177,9 @@ func TestValidVariants(t *testing.T) {
 			}
 			if name == "timing set" && (c.Heartbeat != time.Second || c.RequestResync) {
 				t.Fatalf("%+v", c)
+			}
+			if name == "no outputs" && len(c.Outputs) != 0 {
+				t.Fatalf("outputs %+v", c.Outputs)
 			}
 		})
 	}
