@@ -24,6 +24,10 @@ and drives local HAProxy decisions without a per-request aggregator call.
   separately named aggregate outputs, metadata, consistent keys, and ACLs.
 - Separate missing aggregate entries from incomplete publication. A missing key
   may be zero only when the proven readiness scheme permits that interpretation.
+- Carried in from phase 07: drive `output.Store.SetLease`/`Revoke` from
+  `snapshot.Store.Roster()`. Heartbeats reach the store only through polled
+  `Observe`/`ObserveStatus` (htad polls every 250 ms), so call
+  `ObserveStatus` immediately before deriving a lease from `Roster()`.
 
 ## Acceptance
 

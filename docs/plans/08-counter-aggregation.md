@@ -22,6 +22,11 @@ updates and source entry replacement, without a claim of durable accounting.
   lab requests. Do not call the production merge routine to compute expectations.
 - Keep source expiry and membership changes visible in diagnostics and readiness.
   Removing a required source requires an explicit roster configuration change.
+- Carried in from phase 07: `snapshot.Store.Contributions` and `Lookup` do
+  not check source state, because snapshots are applied in place while a
+  source syncs. Sum only contributions that `Store.Roster().Ready` (or the
+  per-source state) certifies; never present a total built from a syncing,
+  degraded, or missing source as complete.
 
 ## Acceptance
 

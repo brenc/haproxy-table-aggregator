@@ -26,6 +26,10 @@ consumers, with explicit degradation instead of silently incomplete results.
   how replicated TTL and full snapshots limit stale retained contributions.
 - Validate configuration errors before opening listeners. Configuration changes
   requiring a restart are acceptable; hot reconfiguration is outside scope.
+- Carried in from phase 07: `snapshot.Store` expiry and `NextDeadline`
+  scan every entry (O(n)); `max_source_entries` (default 131072) is unmeasured;
+  each "partial" resync reply triggers a full re-teach after 1 s
+  (`sources.DefaultResyncRetry`), whose cost at scale is unmeasured.
 
 ## Acceptance
 

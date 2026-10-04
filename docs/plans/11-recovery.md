@@ -24,6 +24,11 @@ replay as new traffic or claiming completeness before every source is restored.
   Define what the protocol can actually detect and when confidence is restored;
   PID changes alone are not proof of successful or failed handover.
 - Do not add a disk database, write-ahead log, consensus, or standby process.
+- Carried in from phase 07: keys absent from a later session's finished
+  snapshot keep the earlier session's value (tagged `Entry.Session`) until
+  their local expiry, and count against `max_source_entries` meanwhile; a
+  source near the cap that reconnects with a changed key set is refused
+  mid-teach and stays degraded until they expire. Reconcile them here.
 
 ## Acceptance
 
