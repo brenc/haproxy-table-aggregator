@@ -101,14 +101,17 @@ lab-test:
 		$(GO) test -race -count=1 -v ./internal/...; \
 	done
 
-# Regenerates the committed peers-protocol capture fixtures from each
-# pinned build. Review the diff: it should change only PIDs, ports,
-# timestamps, and time-dependent counter fields.
+# Regenerates the committed peers-protocol capture fixtures (framing in
+# internal/peerwire, table messages in internal/peermsg) from each pinned
+# build. Review the diff: it should change only PIDs, ports, timestamps,
+# and time-dependent counter fields (ages, remaining lifetimes).
 peerwire-captures:
 	@set -e; for v in $(HAPROXY_VERSIONS); do \
 		echo "peerwire-captures haproxy $$v"; \
 		HTA_HAPROXY=$(CURDIR)/artifacts/haproxy/$$v/haproxy \
 		HTA_HAPROXY_VERSION=$$v HTA_LAB_RECORD_DIR=$(LAB_RECORD_DIR) \
 		HTA_PEERWIRE_CAPTURE_DIR=$(CURDIR)/internal/peerwire/testdata/captures \
-		$(GO) test -count=1 -run '^TestLiveCapture$$' -v ./internal/peerwire; \
+		HTA_PEERMSG_CAPTURE_DIR=$(CURDIR)/internal/peermsg/testdata/captures \
+		$(GO) test -count=1 -run '^TestLive(Table)?Capture$$' -v \
+			./internal/peerwire ./internal/peermsg; \
 	done
