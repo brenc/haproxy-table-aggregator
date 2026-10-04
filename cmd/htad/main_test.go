@@ -211,7 +211,7 @@ func TestLiveSIGTERM(t *testing.T) {
 	cfg := writeConfig(t, fmt.Sprintf(`{"local_peer": "agg", "insecure_plaintext_loopback_lab": true,
 		"listen": %q, "sources": [{"name": "a"}, {"name": "b", "address": %q}],
 		"tables": [{"name": %q, "period": "10s"}], "idle_timeout": "4s",
-		"outputs": [{"name": %q, "kind": "aggregate", "expire": "30s"}, {"name": %q, "kind": "metadata", "expire": "30s"}]}`,
+		"outputs": [{"name": %q, "kind": "aggregate", "expire": "30s"}, {"name": %q, "kind": "metadata", "expire": "2s"}]}`,
 		listenAddr, b.PeersAddr, lab.LabTable, lab.OutputTable, lab.MetaTable))
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)

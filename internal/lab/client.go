@@ -134,19 +134,30 @@ func (c *Client) Send(ctx context.Context, addr, clientIP string) (Response, err
 }
 
 // ProbeResponse is the output probe listener's answer for one key: what
-// stock HAProxy's table_gpt lookups and ACL saw in the output tables.
+// stock HAProxy's table_gpt lookups and ACLs saw in the output tables.
 type ProbeResponse struct {
-	// Status is 429 when the ACL matched (schema version 1 and a rate at
-	// or above OutputLimit), 200 otherwise.
+	// Status is 429 when the aggregate limit applied (the entry is
+	// authoritative and its rate at or above OutputLimit), 200 otherwise.
 	Status int
 	// Key is the key HAProxy looked up.
 	Key string
-	// Version and Rate are slots 0 and 1 of the OutputTable entry; both
-	// read 0 for a missing entry.
-	Version, Rate int64
-	// MetaVersion is slot 0 of the MetaTable entry ::.
-	MetaVersion int64
+	// Version, Rate, and Gen are slots 0, 1, and 2 of the OutputTable
+	// entry; all read 0 for a missing entry.
+	Version, Rate, Gen int64
+	// MetaVersion and MetaGen are slots 0 and 2 of the MetaTable entry
+	// ::, and LeaseLeft is (deadline - now) mod 2^32 in milliseconds as
+	// the ACL computed it.
+	MetaVersion, MetaGen, LeaseLeft int64
+	// Authority is "aggregate" or "local" (see AuthorityHeader), and
+	// RelativeAuthority what the rule would decide without the deadline
+	// check (see RelativeAuthorityHeader).
+	Authority, RelativeAuthority string
+	// PID is the answering HAProxy process.
+	PID int64
 }
+
+// Aggregate reports whether the frozen rule made the entry authoritative.
+func (r ProbeResponse) Aggregate() bool { return r.Authority == "aggregate" }
 
 // Probe asks a node's probe listener (Node.ProbeAddr) what HAProxy's
 // ordinary output lookups return for clientIP's key. Probing tracks
@@ -167,10 +178,24 @@ func (c *Client) Probe(ctx context.Context, addr, clientIP string) (ProbeRespons
 		return out, fmt.Errorf("probe body: %w", err)
 	}
 	out.Status, out.Key = res.StatusCode, res.Header.Get(KeyHeader)
+	out.Authority, out.RelativeAuthority = res.Header.Get(AuthorityHeader), res.Header.Get(RelativeAuthorityHeader)
+	for _, a := range []string{out.Authority, out.RelativeAuthority} {
+		if a != "aggregate" && a != "local" {
+			return out, fmt.Errorf("probe: status %d, authority %q", res.StatusCode, a)
+		}
+	}
 	for _, f := range []struct {
 		hdr string
 		dst *int64
-	}{{OutVersionHeader, &out.Version}, {OutRateHeader, &out.Rate}, {MetaVersionHeader, &out.MetaVersion}} {
+	}{
+		{OutVersionHeader, &out.Version},
+		{OutRateHeader, &out.Rate},
+		{OutGenHeader, &out.Gen},
+		{MetaVersionHeader, &out.MetaVersion},
+		{MetaGenHeader, &out.MetaGen},
+		{LeaseLeftHeader, &out.LeaseLeft},
+		{PIDHeader, &out.PID},
+	} {
 		v := res.Header.Get(f.hdr)
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {

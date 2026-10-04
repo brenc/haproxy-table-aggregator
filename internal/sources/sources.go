@@ -53,11 +53,11 @@
 // every session teaches to its source (see package peersession): each
 // table once the source has announced a matching definition of it, the
 // whole store whenever the source requests a resync, then each change as
-// Publish makes it. Sessions read the store
-// independently, so a slow source delays only its own session. Output is
-// never an input: the sources' copies of output tables are acknowledged
-// but never queued as events, and no session ever announces an input
-// table.
+// Publish makes it, and the lease (SetLease, Revoke) after the values it
+// certifies. Sessions read the store independently, so a slow source
+// delays only its own session. Output is never an input: the sources'
+// copies of output tables are acknowledged but never queued as events,
+// and no session ever announces an input table.
 package sources
 
 import (
@@ -118,6 +118,11 @@ type Options struct {
 	// the first sessions start. Its tables must be exactly the
 	// configuration's outputs, in order.
 	Output *output.Store
+	// OutputRefresh overrides how often each session re-sends the whole
+	// output (peersession.Options.Refresh): zero keeps the default, a
+	// third of the shortest aggregate table expire; negative disables
+	// it, which only tests should do.
+	OutputRefresh time.Duration
 }
 
 // Manager runs the sessions of every configured source.
@@ -202,7 +207,7 @@ func Start(ctx context.Context, opts Options) (*Manager, error) {
 		}
 		if out == nil {
 			var err error
-			if out, err = output.NewStore(cfg.OutputTables()); err != nil {
+			if out, err = output.NewStore(cfg.OutputTables(), output.StoreOptions{}); err != nil {
 				return nil, fmt.Errorf("sources: %w", err)
 			}
 		}
@@ -224,6 +229,7 @@ func Start(ctx context.Context, opts Options) (*Manager, error) {
 			MaxTables:        cfg.MaxSessionTables,
 			RequestResync:    cfg.RequestResync,
 			Output:           out,
+			Refresh:          opts.OutputRefresh,
 		},
 		log:     log,
 		dial:    opts.Dial,
@@ -295,6 +301,38 @@ func (m *Manager) Publish(table string, key peermsg.Key, values output.Values) e
 		return fmt.Errorf("%w: no output tables configured", output.ErrInvalid)
 	}
 	return m.out.Set(table, key, values)
+}
+
+// SetLease declares every value published so far authoritative until
+// until (see output.Store.SetLease); each session writes the lease into
+// its source's metadata tables after those values. It fails, wrapping
+// output.ErrInvalid, without output tables or for a lease that has
+// already ended or runs longer than output.MaxLeaseLength.
+func (m *Manager) SetLease(until time.Time) error {
+	if m.out == nil {
+		return fmt.Errorf("%w: no output tables configured", output.ErrInvalid)
+	}
+	return m.out.SetLease(until)
+}
+
+// Retire stops publishing key in the aggregate table named table (see
+// output.Store.Retire): no session sends it again, each switches
+// generation so that its sources' copies are never certified again, and
+// HAProxy expires them. It fails, wrapping output.ErrInvalid, without
+// output tables or for a table that is not an aggregate output.
+func (m *Manager) Retire(table string, key peermsg.Key) error {
+	if m.out == nil {
+		return fmt.Errorf("%w: no output tables configured", output.ErrInvalid)
+	}
+	return m.out.Retire(table, key)
+}
+
+// Revoke withdraws authority at once in every source (see
+// output.Store.Revoke). It does nothing without output tables.
+func (m *Manager) Revoke() {
+	if m.out != nil {
+		m.out.Revoke()
+	}
 }
 
 // Events returns the event queue. It is closed after Close once every

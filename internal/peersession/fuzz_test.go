@@ -94,7 +94,8 @@ func FuzzRun(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	store, err := output.NewStore([]output.Table{{Name: "t_out", Kind: output.KindAggregate, Expiry: 30000}})
+	store, err := output.NewStore([]output.Table{{Name: "t_out", Kind: output.KindAggregate, Expiry: 30000}},
+		output.StoreOptions{})
 	if err != nil {
 		f.Fatal(err)
 	}

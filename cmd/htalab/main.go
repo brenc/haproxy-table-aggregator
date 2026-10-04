@@ -126,7 +126,7 @@ func writeHtadConfig(path string, l *lab.Lab, agg *lab.Aggregator) error {
 		"tables": []map[string]string{{"name": lab.LabTable, "period": l.Period.String()}},
 		"outputs": []map[string]string{
 			{"name": lab.OutputTable, "kind": "aggregate", "expire": expire},
-			{"name": lab.MetaTable, "kind": "metadata", "expire": expire},
+			{"name": lab.MetaTable, "kind": "metadata", "expire": lab.MetaExpire.String()},
 		},
 	}
 	buf, err := json.MarshalIndent(doc, "", "  ")

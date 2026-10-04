@@ -21,14 +21,15 @@
 //	  "tables": [{"name": "lab_in", "period": "10s"}],
 //	  "outputs": [
 //	    {"name": "lab_out", "kind": "aggregate", "expire": "30s"},
-//	    {"name": "lab_meta", "kind": "metadata", "expire": "30s"}
+//	    {"name": "lab_meta", "kind": "metadata", "expire": "2s"}
 //	  ]
 //	}
 //
 // Output tables are optional; their layout is fixed by package output.
 // Each must match the source's own stick table of that name (gpt(4) and
-// the same expire), no output name may be an input table name, and
-// outputs need request_resync (the default).
+// the same expire), no output name may be an input table name, a
+// metadata table expires after at most output.MaxLease, and outputs need
+// request_resync (the default).
 package config
 
 import (
@@ -456,6 +457,10 @@ func (c *Config) addOutputs(outputs []FileOutput) error {
 		e := time.Duration(*o.Expire)
 		if e < time.Millisecond || e%time.Millisecond != 0 || e > MaxExpire {
 			return invalid("outputs[%d].expire: %v must be whole milliseconds from 1ms to %v", i, e, MaxExpire)
+		}
+		if kind == output.KindMetadata && e > output.MaxLease {
+			return invalid("outputs[%d].expire: a metadata table holds the lease marker, so it expires after at "+
+				"most %v, not %v", i, output.MaxLease, e)
 		}
 		c.Outputs = append(c.Outputs, Output{Name: o.Name, Kind: kind, Expire: e})
 	}

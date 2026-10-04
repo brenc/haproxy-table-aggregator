@@ -24,7 +24,7 @@ const example = `{
   "tables": [{"name": "lab_in", "period": "10s"}],
   "outputs": [
     {"name": "lab_out", "kind": "aggregate", "expire": "30s"},
-    {"name": "lab_meta", "kind": "metadata", "expire": "30s"}
+    {"name": "lab_meta", "kind": "metadata", "expire": "2s"}
   ]
 }`
 
@@ -50,7 +50,7 @@ func TestExampleAndDefaults(t *testing.T) {
 	}
 	want := []output.Table{
 		{Name: "lab_out", Kind: output.KindAggregate, Expiry: 30000},
-		{Name: "lab_meta", Kind: output.KindMetadata, Expiry: 30000},
+		{Name: "lab_meta", Kind: output.KindMetadata, Expiry: 2000},
 	}
 	if got := c.OutputTables(); !slices.Equal(got, want) {
 		t.Fatalf("output tables %+v, want %+v", got, want)
@@ -131,6 +131,7 @@ func TestInvalid(t *testing.T) {
 		"duplicate output":         edit(`"name": "lab_meta"`, `"name": "lab_out"`),
 		"bad output name":          edit(`"name": "lab_out"`, `"name": "lab out"`),
 		"unknown output kind":      edit(`"kind": "metadata"`, `"kind": "readiness"`),
+		"long metadata expire":     edit(`"expire": "2s"`, `"expire": "2001ms"`),
 		"output without kind":      edit(`"kind": "metadata", `, ``),
 		"output without expire":    edit(`, "expire": "30s"}`, `}`),
 		"output expire too long":   edit(`"expire": "30s"`, `"expire": "600h"`),

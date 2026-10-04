@@ -73,6 +73,9 @@ func (c *Conn) Run(ctx context.Context, sink Sink) (err error) {
 		if err := c.flushAcks(ctx); err != nil {
 			return err
 		}
+		if err := c.refresh(ctx, time.Now()); err != nil {
+			return err
+		}
 		if c.outWake.Swap(false) {
 			if err := c.publish(ctx); err != nil {
 				return err
@@ -82,6 +85,9 @@ func (c *Conn) Run(ctx context.Context, sink Sink) (err error) {
 			return err
 		}
 		next := minTime(c.lastRx.Add(c.opts.IdleTimeout), c.lastTx.Add(c.opts.Heartbeat))
+		if !c.refreshAt.IsZero() {
+			next = minTime(next, c.refreshAt)
+		}
 		if err := c.fill(ctx, next); err != nil && !errors.Is(err, errDeadline) {
 			return err
 		}

@@ -15,7 +15,9 @@ import (
 
 // TestSlowSinkIsNotIdle delivers a burst of updates in one write to a sink
 // that takes most of the idle timeout in total several times over, while
-// the source keeps heartbeating: the session must not end as idle.
+// the source keeps heartbeating: the session must not end as idle. Stats
+// LastRx meanwhile keeps the time the burst was read, so a readiness check
+// on its age sees the backlog that the idle timer deliberately ignores.
 func TestSlowSinkIsNotIdle(t *testing.T) {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(context.Background(), "tcp4", "127.0.0.1:0")
@@ -95,11 +97,14 @@ func TestSlowSinkIsNotIdle(t *testing.T) {
 		}
 	}()
 
+	written := time.Now()
 	accepted := make(chan struct{}, n)
+	lags := make(chan time.Duration, n)
 	done := make(chan error, 1)
 	go func() {
 		done <- pc.Run(ctx, func(_ context.Context, ev peersession.Event) error {
 			if _, ok := ev.(peersession.EntryUpdated); ok {
+				lags <- time.Since(pc.Stats().LastRx)
 				time.Sleep(300 * time.Millisecond) // 10 x 300 ms = 3 idle timeouts
 				accepted <- struct{}{}
 			}
@@ -115,6 +120,14 @@ func TestSlowSinkIsNotIdle(t *testing.T) {
 		case <-deadline:
 			t.Fatal("updates not delivered")
 		}
+	}
+	var lag time.Duration
+	for range n {
+		lag = <-lags
+	}
+	if want := time.Duration(n-1) * 300 * time.Millisecond; lag < want-50*time.Millisecond ||
+		lag > time.Since(written) {
+		t.Fatalf("LastRx was %v old at the last update of the burst, want about %v", lag, want)
 	}
 	time.Sleep(300 * time.Millisecond)
 	cancel()

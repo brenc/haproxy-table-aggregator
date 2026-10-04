@@ -34,7 +34,31 @@ type Options struct {
 	// not announced. Output table names must differ from input names,
 	// and RequestResync must be set: stock HAProxy announces a table it
 	// never updates itself, as an output table, only while teaching.
+	//
+	// The store's lease is written into every metadata table as a timed
+	// update, and only once every output table has been taught in this
+	// session and every value the lease certifies has been written
+	// ahead of it on the connection: a marker never overtakes the
+	// output it certifies, and a teach never replays an old marker.
+	// Every entry the session writes, values and markers, carries the
+	// session's Generation, so a marker certifies only its own session's
+	// values.
 	Output *output.Store
+	// Generation is the session's output generation (see package
+	// output). Zero picks a random non-zero one, as every session should:
+	// a generation must differ from every earlier session's to the
+	// same source. Tests set it to read fixed output. The session picks
+	// a new random generation, and re-sends the whole output under it,
+	// whenever Store.Retire removes keys.
+	Generation uint32
+	// Refresh is how often a session whose output tables are all taught
+	// re-sends every output entry under its generation (definitions and
+	// values, then the lease again), so that an entry another writer
+	// overwrote in HAProxy (an old process's teach on a soft reload)
+	// regains aggregate authority within Refresh, and an unchanged entry
+	// never expires in HAProxy while published. Zero means a third of the
+	// shortest aggregate table expiry; negative disables it (tests).
+	Refresh time.Duration
 	// Heartbeat is the longest this side stays silent once established.
 	Heartbeat time.Duration
 	// IdleTimeout ends an established session after this long without a
@@ -151,12 +175,30 @@ type Stats struct {
 	// when the source first announces it, and one (of every announced
 	// table) per resync request from the source.
 	Teaches uint64
-	// OutputUpdates counts output entry updates sent; TaughtUpdates
-	// counts those sent by teaches, the rest were live changes.
+	// Refreshes counts periodic re-sends of the whole output (see
+	// Options.Refresh); their updates count as TaughtUpdates.
+	Refreshes uint64
+	// OutputUpdates counts aggregate entry updates sent; TaughtUpdates
+	// counts those sent by teaches, the rest were live changes. Lease
+	// markers are counted in Markers only.
 	OutputUpdates uint64
 	TaughtUpdates uint64
 	// AcksReceived counts acknowledgements of output updates.
 	AcksReceived uint64
+	// Markers counts lease markers written to the metadata tables
+	// (revocations included); Revocations counts the revocations.
+	// LastMarker is when the last one was written, and LastDeadline
+	// its deadline slot. Written means handed to the connection, not
+	// delivered: the deadline, not this time, bounds its authority.
+	Markers      uint64
+	Revocations  uint64
+	LastMarker   time.Time
+	LastDeadline uint32
+	// Generation is the session's current output generation.
+	Generation uint32
+	// Rotations counts generation changes after Store.Retire, each with
+	// a full re-send of the output.
+	Rotations uint64
 	// Outputs describes each output table, in local ID order.
 	Outputs []OutputStats
 }
@@ -230,6 +272,27 @@ type Conn struct {
 	taught       atomic.Uint64
 	acksRecv     atomic.Uint64
 	outWake      atomic.Bool // the output store changed since the last send
+	markers      atomic.Uint64
+	revocations  atomic.Uint64
+	markerNano   atomic.Int64
+	markerDL     atomic.Uint32
+
+	// leaseSent is the lease generation last written (0: none), and
+	// markerDue forces the next publish to write the lease again, after
+	// a teach.
+	leaseSent uint64
+	markerDue bool
+	// refreshAt is when the next periodic refresh is due; zero until
+	// every output table is taught.
+	refreshAt time.Time
+	refreshes atomic.Uint64
+
+	// gen is the session's current output generation, changed only when
+	// a Retire is seen (retiredSeen is the store's count then).
+	gen         uint32
+	genA        atomic.Uint32
+	retiredSeen uint64
+	rotations   atomic.Uint64
 }
 
 // tableKind is how a session treats a table the source announced.
@@ -245,6 +308,7 @@ const (
 type outTable struct {
 	id   peermsg.LocalTableID
 	def  peermsg.Definition
+	kind output.Kind
 	last peermsg.UpdateID // last update ID sent
 	sent uint64
 	// ready is set once the source announced a matching definition of
@@ -311,6 +375,26 @@ func NewConn(nc net.Conn, opts Options) (*Conn, error) {
 		outNames: map[string]*outTable{},
 	}
 	if opts.Output != nil {
+		if opts.Generation == 0 {
+			g, err := output.NewGeneration()
+			if err != nil {
+				return nil, fmt.Errorf("peersession: %w", err)
+			}
+			c.opts.Generation = g
+		}
+		c.gen = c.opts.Generation
+		c.genA.Store(c.gen)
+		c.retiredSeen = opts.Output.Retired()
+		if opts.Refresh == 0 {
+			for _, def := range opts.Output.Tables() {
+				if k, _ := opts.Output.Kind(def.Name); k != output.KindAggregate {
+					continue
+				}
+				if r := def.Expiry.Duration() / 3; c.opts.Refresh == 0 || r < c.opts.Refresh {
+					c.opts.Refresh = r
+				}
+			}
+		}
 		if !opts.RequestResync {
 			return nil, errors.New("peersession: output needs RequestResync: the source announces output tables only when it teaches")
 		}
@@ -324,7 +408,8 @@ func NewConn(nc net.Conn, opts Options) (*Conn, error) {
 			if err != nil {
 				return nil, fmt.Errorf("peersession: output table: %w", err)
 			}
-			t := &outTable{id: id, def: def}
+			kind, _ := opts.Output.Kind(def.Name)
+			t := &outTable{id: id, def: def, kind: kind}
 			c.outs = append(c.outs, t)
 			c.outNames[def.Name] = t
 		}
@@ -358,9 +443,18 @@ func (c *Conn) Stats() Stats {
 		OutputUpdates:   c.outUpdates.Load(),
 		TaughtUpdates:   c.taught.Load(),
 		AcksReceived:    c.acksRecv.Load(),
+		Markers:         c.markers.Load(),
+		Revocations:     c.revocations.Load(),
+		LastDeadline:    c.markerDL.Load(),
+		Generation:      c.genA.Load(),
+		Rotations:       c.rotations.Load(),
+		Refreshes:       c.refreshes.Load(),
 	}
 	if n := c.lastRxNano.Load(); n != 0 {
 		s.LastRx = time.Unix(0, n)
+	}
+	if n := c.markerNano.Load(); n != 0 {
+		s.LastMarker = time.Unix(0, n)
 	}
 	for _, t := range c.outs {
 		s.Outputs = append(s.Outputs, OutputStats{

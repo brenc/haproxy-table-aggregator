@@ -40,10 +40,26 @@
 // HAProxy does. Stock HAProxy announces a table that it never updates
 // itself, as an output table, only in a teach, so a session with output
 // must request a resync (Options.RequestResync). Every update carries an
-// explicit update ID, counted per table from 1 in each session, and is
-// ordinary (untimed), so the source's table expire applies from
-// reception. The source acknowledges with this side's table IDs, which
-// are a namespace separate from the source's own IDs.
+// explicit update ID, counted per table from 1 in each session. Aggregate
+// updates are ordinary (untimed), so the source's table expire applies
+// from reception. The source acknowledges with this side's table IDs,
+// which are a namespace separate from the source's own IDs.
+//
+// The store's lease is written into each metadata table as a timed
+// update of the single key :: whose remaining lifetime is the time the
+// lease has left, and only once every output table has been taught in the
+// session. A marker is never taught from the store: each session writes
+// the current lease after the values it certifies (read before them), so
+// a marker cannot overtake output still unsent, and a lease that has run
+// out is not written at all. Acknowledgements are transport progress only
+// and play no part in it.
+//
+// Every entry the session writes carries its generation, so a marker
+// certifies only that session's values. Once every output table is
+// taught, the session re-sends the whole output every Options.Refresh,
+// then the lease again, so an entry another writer overwrote regains
+// authority within the interval and no published entry expires in the
+// source.
 //
 // The source's own copy of an output table (which HAProxy replays when it
 // teaches) must have exactly the definition this side announces; its

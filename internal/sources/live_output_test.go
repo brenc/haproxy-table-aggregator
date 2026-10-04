@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,7 +31,7 @@ func liveOutputConfig(t *testing.T, period time.Duration, srcs ...config.FileSou
 		Tables:                       []config.FileTable{{Name: lab.LabTable, Period: d(period)}},
 		Outputs: []config.FileOutput{
 			{Name: lab.OutputTable, Kind: "aggregate", Expire: expire},
-			{Name: lab.MetaTable, Kind: "metadata", Expire: expire},
+			{Name: lab.MetaTable, Kind: "metadata", Expire: d(lab.MetaExpire)},
 		},
 		IdleTimeout:  d(config.MinIdleTimeout),
 		ReconnectMin: d(50 * time.Millisecond),
@@ -74,8 +75,53 @@ func waitProbe(t *testing.T, n *lab.Node, client, what string, pred func(lab.Pro
 	}
 }
 
-// expectRate is a probe predicate for a published aggregate rate: schema
-// version 1, the rate, and the ACL decision against lab.OutputLimit.
+// renewLease keeps the store's lease running for the longest lease
+// (output.MaxLeaseLength) from each renewal, renewing every quarter
+// lease, until the returned function is called.
+// That returns when the last renewal was set: the last valid
+// publication.
+func renewLease(t *testing.T, store *output.Store) (stop func() time.Time) {
+	t.Helper()
+	const lease = output.MaxLeaseLength
+	var mu sync.Mutex
+	last := time.Now()
+	if err := store.SetLease(last.Add(lease)); err != nil {
+		t.Fatal(err)
+	}
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		tick := time.NewTicker(lease / 4)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+				mu.Lock()
+				last = time.Now()
+				err := store.SetLease(last.Add(lease))
+				mu.Unlock()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() time.Time {
+		once.Do(func() { close(done) })
+		<-stopped
+		mu.Lock()
+		defer mu.Unlock()
+		return last
+	}
+}
+
+// expectRate is a probe predicate for a published aggregate rate under a
+// live lease: schema version 2, the rate, aggregate authority, and the
+// ACL decision against lab.OutputLimit.
 func expectRate(rate uint32) func(lab.ProbeResponse) bool {
 	status := http.StatusOK
 	if rate >= lab.OutputLimit {
@@ -83,7 +129,7 @@ func expectRate(rate uint32) func(lab.ProbeResponse) bool {
 	}
 	return func(r lab.ProbeResponse) bool {
 		return r.Version == output.SchemaVersion && r.Rate == int64(rate) && r.Status == status &&
-			r.MetaVersion == output.SchemaVersion
+			r.MetaVersion == output.SchemaVersion && r.Aggregate()
 	}
 }
 
@@ -149,7 +195,7 @@ func TestLiveOutput(t *testing.T) {
 	cfg := liveOutputConfig(t, l.Period,
 		config.FileSource{Name: "a"},
 		config.FileSource{Name: "b", Address: b.PeersAddr})
-	store, err := output.NewStore(cfg.OutputTables())
+	store, err := output.NewStore(cfg.OutputTables(), output.StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,12 +212,11 @@ func TestLiveOutput(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.Set(lab.MetaTable, output.MetadataKey, output.MetadataValues()); err != nil {
-		t.Fatal(err)
-	}
-	const initialEntries = 4
+	const initialEntries = 3
 
 	m, r := startManager(t, sources.Options{Config: cfg, Listener: ln, Output: store})
+	// Keep the output authoritative so that the ACL applies it.
+	defer renewLease(t, store)()
 	r.waitFor("both sessions up, resynced, and inputs replayed", 20*time.Second, func(evs []sources.Event) bool {
 		return count[peersession.SyncFinished](evs, "a") == 1 && count[peersession.SyncFinished](evs, "b") == 1 &&
 			countIs("a", keyA, 10)(evs) && countIs("b", keyB, 20)(evs)
@@ -463,7 +508,7 @@ func TestLiveOutputNeedsMatchingTable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			store, err := output.NewStore(cfg.OutputTables())
+			store, err := output.NewStore(cfg.OutputTables(), output.StoreOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}

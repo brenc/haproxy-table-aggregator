@@ -18,10 +18,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/brenc/haproxy-table-aggregator/internal/output"
 )
 
 // DefaultNodes are the node names Start uses when Options.Nodes is empty.
@@ -62,6 +65,14 @@ type Options struct {
 	// the two output tables (OutputTable, MetaTable), and a probe
 	// listener reading the output.
 	Aggregator *Aggregator
+	// Reloadable keeps every node's inherited listeners open so that
+	// Node.Reload can hand them to a new process, and binds each node's
+	// peers section on a Unix socket in the lab directory instead of a
+	// TCP port: on a soft reload the old process connects to the local
+	// peer's address to teach the new one, which an inherited descriptor
+	// does not have. Node.PeersAddr is then empty, so the aggregator
+	// cannot dial the nodes; they dial it.
+	Reloadable bool
 }
 
 // Aggregator describes the aggregator peer the lab nodes are configured
@@ -122,8 +133,11 @@ type Node struct {
 	// IPv6 loopback is unavailable on this host.
 	ProdAddr6 string
 	// PeersAddr is the node's peers bind (127.0.0.1:port) when the lab has
-	// an aggregator, or empty.
+	// an aggregator and is not Reloadable, or empty.
 	PeersAddr string
+	// PeersPath is the node's peers bind (a Unix socket path) when the lab
+	// has an aggregator and is Reloadable, or empty.
+	PeersPath string
 	// ProbeAddr is the output probe listener (127.0.0.1:port) when the lab
 	// has an aggregator, or empty. See Client.Probe.
 	ProbeAddr string
@@ -138,6 +152,20 @@ type Node struct {
 	// LogPath receives HAProxy's stdout and stderr.
 	LogPath string
 
+	cmd    *exec.Cmd
+	exited chan struct{}
+	proc   *process
+
+	// For Reload: the binary, the lab directory, the listeners kept
+	// open, and the processes a reload replaced, which Close stops too.
+	haproxy string
+	dir     string
+	files   []*os.File
+	retired []*process
+}
+
+// process is one started HAProxy process.
+type process struct {
 	cmd     *exec.Cmd
 	exited  chan struct{}
 	waitErr error
@@ -192,7 +220,7 @@ func Start(ctx context.Context, opts Options) (_ *Lab, err error) {
 		return nil, err
 	}
 	for _, name := range nodes {
-		n, startErr := l.startNode(ctx, record.HAProxyPath, name, opts.Aggregator)
+		n, startErr := l.startNode(ctx, record.HAProxyPath, name, opts.Aggregator, opts.Reloadable)
 		if n != nil {
 			l.Nodes = append(l.Nodes, n)
 		}
@@ -288,20 +316,28 @@ func listenInherited(ctx context.Context, network, address string) (inheritedLis
 	return inheritedListener{addr: ln.Addr().String(), file: f}, nil
 }
 
-func (l *Lab) startNode(ctx context.Context, haproxy, name string, agg *Aggregator) (*Node, error) {
+func (l *Lab) startNode(ctx context.Context, haproxy, name string, agg *Aggregator, reloadable bool) (*Node, error) {
 	n := &Node{
 		Name:       name,
 		Socket:     filepath.Join(l.Dir, name+".sock"),
 		ConfigPath: filepath.Join(l.Dir, name+".cfg"),
 		LogPath:    filepath.Join(l.Dir, name+".log"),
+		haproxy:    haproxy,
+		dir:        l.Dir,
 	}
-	if len(n.Socket) > maxSocketPath {
-		return nil, fmt.Errorf("lab: runtime socket path %s exceeds HAProxy's %d-byte limit; use a shorter BaseDir or TMPDIR",
-			n.Socket, maxSocketPath)
+	for _, p := range []string{n.Socket, filepath.Join(l.Dir, name+".peers")} {
+		if len(p) > maxSocketPath {
+			return nil, fmt.Errorf("lab: socket path %s exceeds HAProxy's %d-byte limit; use a shorter BaseDir or TMPDIR",
+				p, maxSocketPath)
+		}
 	}
 
 	var files []*os.File
 	defer func() {
+		if reloadable {
+			n.files = files
+			return
+		}
 		for _, f := range files {
 			_ = f.Close()
 		}
@@ -338,10 +374,15 @@ func (l *Lab) startNode(ctx context.Context, haproxy, name string, agg *Aggregat
 	n.LabAddr, n.ProdAddr4, n.ProdAddr6, n.ProxyAddr = labAddr, prod4, prod6, proxyAddr
 	var aggName, aggAddr, peersBind, probeBind string
 	outputFirst := false
-	if agg != nil {
+	if agg != nil && reloadable {
+		n.PeersPath = filepath.Join(l.Dir, name+".peers")
+		peersBind = n.PeersPath
+	} else if agg != nil {
 		if n.PeersAddr, peersBind, err = inherit("tcp4", "127.0.0.1:0"); err != nil {
 			return nil, fmt.Errorf("lab: node %s peers listener: %w", name, err)
 		}
+	}
+	if agg != nil {
 		if n.ProbeAddr, probeBind, err = inherit("tcp4", "127.0.0.1:0"); err != nil {
 			return nil, fmt.Errorf("lab: node %s probe listener: %w", name, err)
 		}
@@ -373,12 +414,11 @@ func (l *Lab) startNode(ctx context.Context, haproxy, name string, agg *Aggregat
 		ProbeBind:   probeBind,
 		OutTable:    OutputTable,
 		MetaTable:   MetaTable,
+		MetaExpMS:   millis(MetaExpire),
 		OutSlots:    OutputSlots,
 		OutLimit:    OutputLimit,
-
-		OutVersionHdr:  OutVersionHeader,
-		OutRateHdr:     OutRateHeader,
-		MetaVersionHdr: MetaVersionHeader,
+		LeaseMS:     output.LeaseWindowMillis,
+		ProbeHdrs:   probeHeaders(OutputTable, MetaTable),
 	})
 	if err != nil {
 		return nil, err
@@ -399,7 +439,14 @@ func (n *Node) spawn(ctx context.Context, haproxy, dir string, cfg []byte, files
 	if err := os.WriteFile(n.ConfigPath, cfg, 0o600); err != nil {
 		return err
 	}
-	logFile, err := os.OpenFile(n.LogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	return n.start(ctx, haproxy, dir, files, os.O_TRUNC)
+}
+
+// start starts haproxy on n.ConfigPath with extra arguments, makes it
+// n's process, and waits until it answers on n.Socket. logFlag is
+// os.O_TRUNC or os.O_APPEND for n.LogPath.
+func (n *Node) start(ctx context.Context, haproxy, dir string, files []*os.File, logFlag int, args ...string) error {
+	logFile, err := os.OpenFile(n.LogPath, os.O_CREATE|os.O_WRONLY|logFlag, 0o600)
 	if err != nil {
 		return err
 	}
@@ -407,7 +454,7 @@ func (n *Node) spawn(ctx context.Context, haproxy, dir string, cfg []byte, files
 
 	//nolint:noctx,gosec // G204: running the operator-chosen haproxy is the
 	// point; its lifetime is owned by Close rather than a context.
-	cmd := exec.Command(haproxy, "-db", "-f", n.ConfigPath)
+	cmd := exec.Command(haproxy, append([]string{"-db", "-f", n.ConfigPath}, args...)...)
 	cmd.Dir = dir
 	cmd.Env = []string{}
 	cmd.Stdout = logFile
@@ -416,15 +463,36 @@ func (n *Node) spawn(ctx context.Context, haproxy, dir string, cfg []byte, files
 	if err := startOwned(cmd); err != nil {
 		return fmt.Errorf("start: %w", err)
 	}
-	n.cmd = cmd
-	n.exited = make(chan struct{})
+	p := &process{cmd: cmd, exited: make(chan struct{})}
+	n.cmd, n.exited, n.proc = cmd, p.exited, p
 	go func() {
-		n.waitErr = cmd.Wait()
-		close(n.exited)
+		p.waitErr = cmd.Wait()
+		close(p.exited)
 	}()
 
 	if err := n.waitReady(ctx); err != nil {
 		return fmt.Errorf("%w\n%s", err, n.logTail())
+	}
+	return nil
+}
+
+// Reload soft-reloads a node of a Reloadable lab as an init system
+// would: it starts a new HAProxy process on the same configuration and
+// listeners with -sf naming the current one, which stops accepting and,
+// as HAProxy does on every soft reload, connects to the new process's
+// local peer to teach it every shared stick table, then exits. Reload
+// returns once the new process answers on the runtime socket; the old
+// one keeps running until it finishes (Close stops it if it has not).
+func (n *Node) Reload(ctx context.Context) error {
+	if n.files == nil {
+		return fmt.Errorf("lab: node %s is not reloadable", n.Name)
+	}
+	if n.Exited() {
+		return fmt.Errorf("lab: node %s has exited", n.Name)
+	}
+	n.retired = append(n.retired, n.proc)
+	if err := n.start(ctx, n.haproxy, n.dir, n.files, os.O_APPEND, "-sf", strconv.Itoa(n.PID())); err != nil {
+		return fmt.Errorf("lab: reload node %s: %w", n.Name, err)
 	}
 	return nil
 }
@@ -437,13 +505,15 @@ func (n *Node) waitReady(ctx context.Context) error {
 	for {
 		select {
 		case <-n.exited:
-			return fmt.Errorf("haproxy exited during startup: %w", n.waitErr)
+			return fmt.Errorf("haproxy exited during startup: %w", n.proc.waitErr)
 		case <-ctx.Done():
 			return fmt.Errorf("haproxy not ready: %w", ctx.Err())
 		case <-tick.C:
 		}
+		// After a reload the socket path may still reach the old
+		// process for a moment: wait for this one's own PID.
 		reply, err := RuntimeCommand(ctx, n.Socket, "show info")
-		if err == nil && strings.Contains(reply, "Pid:") {
+		if err == nil && strings.Contains(reply, "\nPid: "+strconv.Itoa(n.PID())+"\n") {
 			return nil
 		}
 	}
@@ -496,7 +566,7 @@ func (n *Node) ShowTable(ctx context.Context, table string) (Table, error) {
 // Addrs returns every listener address the node owns.
 func (n *Node) Addrs() []string {
 	var addrs []string
-	for _, a := range []string{n.LabAddr, n.ProdAddr4, n.ProxyAddr, n.ProdAddr6, n.PeersAddr, n.ProbeAddr} {
+	for _, a := range []string{n.LabAddr, n.ProdAddr4, n.ProxyAddr, n.ProdAddr6, n.PeersAddr, n.PeersPath, n.ProbeAddr} {
 		if a != "" {
 			addrs = append(addrs, a)
 		}
@@ -505,18 +575,39 @@ func (n *Node) Addrs() []string {
 }
 
 func (n *Node) stop() error {
-	if n.cmd == nil || n.Exited() {
-		return nil
+	defer func() {
+		for _, f := range n.files {
+			_ = f.Close()
+		}
+		n.files = nil
+	}()
+	var errs []error
+	for _, p := range n.retired {
+		errs = append(errs, stopProcess(n.Name, p.cmd, p.exited))
 	}
-	_ = n.cmd.Process.Signal(syscall.SIGTERM)
+	if n.cmd != nil {
+		errs = append(errs, stopProcess(n.Name, n.cmd, n.exited))
+	}
+	return errors.Join(errs...)
+}
+
+// stopProcess sends SIGTERM, then SIGKILL after a grace period, unless the
+// process has exited.
+func stopProcess(name string, cmd *exec.Cmd, exited <-chan struct{}) error {
 	select {
-	case <-n.exited:
+	case <-exited:
+		return nil
+	default:
+	}
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-exited:
 		return nil
 	case <-time.After(stopTimeout):
 	}
-	if err := n.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return fmt.Errorf("lab: kill node %s: %w", n.Name, err)
+	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("lab: kill node %s: %w", name, err)
 	}
-	<-n.exited
+	<-exited
 	return nil
 }

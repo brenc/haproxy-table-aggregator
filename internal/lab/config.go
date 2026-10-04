@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"strconv"
+	"strings"
 	"text/template"
 	"time"
+
+	"github.com/brenc/haproxy-table-aggregator/internal/output"
 )
 
 // Stick-table names used by every lab node. LabTable is fed only by the
@@ -23,7 +26,9 @@ const (
 // Output tables, present only when the lab has an aggregator, which
 // writes them over the peers protocol. No request rule tracks them; only
 // the probe listener reads them. Both store gpt(4) (output schema
-// version 1, package output) and expire like the input tables.
+// version 2, package output). The aggregate table expires like the input
+// tables; the metadata table, which holds the lease marker, after
+// MetaExpire.
 const (
 	// OutputTable is the aggregate output table, keyed like LabTable.
 	OutputTable = "lab_out"
@@ -31,11 +36,13 @@ const (
 	MetaTable = "lab_meta"
 	// OutputSlots is the gpt array length of both output tables.
 	OutputSlots = 4
+	// MetaExpire is MetaTable's expire: output.MaxLease.
+	MetaExpire = output.MaxLease
 )
 
-// OutputLimit is the probe listener's ACL threshold: a lookup whose
-// output entry carries schema version 1 and a rate at or above it is
-// answered 429, any other 200.
+// OutputLimit is the probe listener's aggregate limit: a lookup whose
+// output is authoritative (see output package documentation) and whose
+// rate is at or above it is answered 429, any other 200.
 const OutputLimit = 1000
 
 // HTTP headers exchanged between the harness, HAProxy, and the responder.
@@ -56,13 +63,27 @@ const (
 	// LookupHeader is set by HAProxy on the response to the http_req_cnt it
 	// looks up with the same key expression used for tracking.
 	LookupHeader = "X-Lab-Lookup-Cnt"
-	// OutVersionHeader, OutRateHeader, and MetaVersionHeader are set by
-	// the probe listener to table_gpt lookups: slots 0 and 1 of the
-	// OutputTable entry for the probed key, and slot 0 of the MetaTable
-	// entry ::. A missing entry reads 0.
+	// The probe listener's response headers: table_gpt lookups of the
+	// OutputTable entry for the probed key (version, rate, generation) and of
+	// the MetaTable entry :: (version, generation), the lease time left as the
+	// ACL computes it, and the authority decisions. A missing entry reads
+	// 0.
 	OutVersionHeader  = "X-Lab-Out-Version"
 	OutRateHeader     = "X-Lab-Out-Rate"
+	OutGenHeader      = "X-Lab-Out-Gen"
 	MetaVersionHeader = "X-Lab-Meta-Version"
+	MetaGenHeader     = "X-Lab-Meta-Gen"
+	LeaseLeftHeader   = "X-Lab-Lease-Left"
+	// PIDHeader is the answering HAProxy process's PID.
+	PIDHeader = "X-Lab-Pid"
+	// AuthorityHeader is "aggregate" when the frozen phase 06 rule makes
+	// the key's aggregate entry authoritative, else "local".
+	AuthorityHeader = "X-Lab-Authority"
+	// RelativeAuthorityHeader applies the same rule without the absolute
+	// deadline check, trusting the marker's relative lifetime alone. It
+	// exists to show what that weaker rule would decide; nothing
+	// enforces it.
+	RelativeAuthorityHeader = "X-Lab-Relative-Authority"
 )
 
 // ExpiryFactor is how many rate periods a table entry outlives its last
@@ -89,10 +110,8 @@ type configParams struct {
 	ListenerHdr string
 	KeyHdr      string
 	LookupHdr   string
-	// Probe response headers.
-	OutVersionHdr  string
-	OutRateHdr     string
-	MetaVersionHdr string
+	// Probe response headers (see probeHeaders).
+	ProbeHdrs string
 	// Aggregator peers section; empty AggName means none.
 	AggName   string
 	AggAddr   string
@@ -104,8 +123,10 @@ type configParams struct {
 	ProbeBind   string
 	OutTable    string
 	MetaTable   string
+	MetaExpMS   string
 	OutSlots    int
 	OutLimit    int
+	LeaseMS     int
 }
 
 // The key expression is stored once in txn.lab_key and reused for tracking,
@@ -196,17 +217,28 @@ frontend proxy
 
 {{- if .AggName}}
 
-# Output probe: answers from the aggregator's output with ordinary
-# table_gpt lookups and an ACL. It tracks nothing, so probing never
-# changes an input table.
+# Output probe: answers from the aggregator's output with the frozen
+# phase 06 authority rule (package output). It tracks nothing, so probing
+# never changes an input table, and it has no local limit: 429 means the
+# aggregate limit applied, 200 that it did not.
 frontend probe
     bind {{.ProbeBind}}
     http-request set-var(txn.lab_key) req.hdr_ip({{.ClientHdr}}),ipmask(32,64) if { req.hdr_cnt({{.ClientHdr}}) eq 1 }
     http-request deny deny_status 400 unless { var(txn.lab_key) -m found }
-    acl out_v1 var(txn.lab_key),table_gpt(0,{{.OutTable}}) eq 1
-    acl out_over var(txn.lab_key),table_gpt(1,{{.OutTable}}) ge {{.OutLimit}}
-    http-request return status 429 hdr {{.KeyHdr}} "%[var(txn.lab_key)]" hdr {{.OutVersionHdr}} "%[var(txn.lab_key),table_gpt(0,{{.OutTable}})]" hdr {{.OutRateHdr}} "%[var(txn.lab_key),table_gpt(1,{{.OutTable}})]" hdr {{.MetaVersionHdr}} "%[ipv6(::),table_gpt(0,{{.MetaTable}})]" if out_v1 out_over
-    http-request return status 200 hdr {{.KeyHdr}} "%[var(txn.lab_key)]" hdr {{.OutVersionHdr}} "%[var(txn.lab_key),table_gpt(0,{{.OutTable}})]" hdr {{.OutRateHdr}} "%[var(txn.lab_key),table_gpt(1,{{.OutTable}})]" hdr {{.MetaVersionHdr}} "%[ipv6(::),table_gpt(0,{{.MetaTable}})]"
+    http-request set-var(txn.agg_now) date(0,ms),and(4294967295)
+    http-request set-var(txn.agg_left) ipv6(::),table_gpt(1,{{.MetaTable}}),sub(txn.agg_now),and(4294967295)
+    http-request set-var(txn.agg_gen) ipv6(::),table_gpt(2,{{.MetaTable}})
+    acl agg_meta  ipv6(::),table_gpt(0,{{.MetaTable}}) eq 2
+    acl agg_lease var(txn.agg_left) -m int le {{.LeaseMS}}
+    acl agg_v2    var(txn.lab_key),table_gpt(0,{{.OutTable}}) eq 2
+    acl agg_gen   var(txn.lab_key),table_gpt(2,{{.OutTable}}),sub(txn.agg_gen) eq 0
+    acl agg_over  var(txn.lab_key),table_gpt(1,{{.OutTable}}) ge {{.OutLimit}}
+    http-request set-var(txn.agg_auth) str(aggregate) if agg_meta agg_lease agg_v2 agg_gen
+    http-request set-var(txn.agg_auth) str(local) unless agg_meta agg_lease agg_v2 agg_gen
+    http-request set-var(txn.agg_rel) str(aggregate) if agg_meta agg_v2 agg_gen
+    http-request set-var(txn.agg_rel) str(local) unless agg_meta agg_v2 agg_gen
+    http-request return status 429 {{.ProbeHdrs}} if agg_meta agg_lease agg_v2 agg_gen agg_over
+    http-request return status 200 {{.ProbeHdrs}}
 {{- end}}
 
 backend responder
@@ -218,7 +250,7 @@ backend {{.OutTable}}
     stick-table type ipv6 size 1k expire {{.ExpireMS}} store gpt({{.OutSlots}}) peers agg
 
 backend {{.MetaTable}}
-    stick-table type ipv6 size 16 expire {{.ExpireMS}} store gpt({{.OutSlots}}) peers agg
+    stick-table type ipv6 size 16 expire {{.MetaExpMS}} store gpt({{.OutSlots}}) peers agg
 {{- end}}
 `))
 
@@ -228,6 +260,30 @@ func renderConfig(p configParams) ([]byte, error) {
 		return nil, fmt.Errorf("render haproxy config: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// probeHeaders renders the probe listener's response headers.
+func probeHeaders(outTable, metaTable string) string {
+	out := func(slot int) string {
+		return fmt.Sprintf("%%[var(txn.lab_key),table_gpt(%d,%s)]", slot, outTable)
+	}
+	hdrs := []struct{ name, value string }{
+		{KeyHeader, "%[var(txn.lab_key)]"},
+		{OutVersionHeader, out(0)},
+		{OutRateHeader, out(1)},
+		{OutGenHeader, out(2)},
+		{MetaVersionHeader, fmt.Sprintf("%%[ipv6(::),table_gpt(0,%s)]", metaTable)},
+		{MetaGenHeader, "%[var(txn.agg_gen)]"},
+		{LeaseLeftHeader, "%[var(txn.agg_left)]"},
+		{AuthorityHeader, "%[var(txn.agg_auth)]"},
+		{RelativeAuthorityHeader, "%[var(txn.agg_rel)]"},
+		{PIDHeader, "%[pid]"},
+	}
+	parts := make([]string, len(hdrs))
+	for i, h := range hdrs {
+		parts[i] = fmt.Sprintf("hdr %s %q", h.name, h.value)
+	}
+	return strings.Join(parts, " ")
 }
 
 func millis(d time.Duration) string {
