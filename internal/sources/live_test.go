@@ -361,6 +361,7 @@ func waitSkipped(t *testing.T, m *sources.Manager, source string) {
 type gateListener struct {
 	net.Listener
 	open     chan struct{}
+	openOnce sync.Once
 	accepted chan struct{}
 	conns    chan *gateConn
 }
@@ -384,6 +385,10 @@ func newGate(ln net.Listener) *gateListener {
 		conns: make(chan *gateConn, 16),
 	}
 }
+
+// release opens the gate; held reads proceed. It is safe to call more
+// than once, so cleanup can release a gate the test never reached.
+func (g *gateListener) release() { g.openOnce.Do(func() { close(g.open) }) }
 
 func (g *gateListener) Accept() (net.Conn, error) {
 	c, err := g.Listener.Accept()
@@ -432,6 +437,21 @@ func TestLiveSimultaneous(t *testing.T) {
 		Config: cfg, Listener: gate, Dial: dial,
 		Logger: slog.New(slog.NewTextHandler(logs, nil)),
 	})
+	// This test has stalled intermittently on a busy host with no session
+	// back within the wait; capture both sides while node a is still up.
+	// Releasing the gate lets the manager close a held connection if the
+	// test failed before opening it.
+	t.Cleanup(func() {
+		defer gate.release()
+		if !t.Failed() {
+			return
+		}
+		t.Logf("daemon log:\n%s", logs.String())
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		reply, err := a.Runtime(ctx, "show peers")
+		t.Logf("node a show peers (err %v):\n%s", err, reply)
+	})
 	held := <-gate.conns
 
 	evs := r.waitFor("outbound session up", 15*time.Second, upCount("a", 1))
@@ -444,7 +464,7 @@ func TestLiveSimultaneous(t *testing.T) {
 		t.Errorf("HAProxy recorded no collision: %v", st.Fields)
 	}
 
-	close(gate.open)
+	gate.release()
 	select {
 	case <-held.closed:
 	case <-time.After(10 * time.Second):
