@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/brenc/haproxy-table-aggregator/internal/output"
 	"github.com/brenc/haproxy-table-aggregator/internal/peermsg"
 	"github.com/brenc/haproxy-table-aggregator/internal/peerwire"
 )
@@ -20,9 +21,20 @@ import (
 type Options struct {
 	// LocalPeer is this side's peer name.
 	LocalPeer string
-	// Tables are the input tables by HAProxy table name. Every other
-	// table the source announces is ignored.
+	// Tables are the input tables by HAProxy table name. Every table the
+	// source announces that is neither an input nor an output table is
+	// ignored.
 	Tables map[string]TableSpec
+	// Output, if non-nil, is the published output this session teaches
+	// to the source: its tables are announced under local IDs 1, 2, ...
+	// in Output.Tables order. A table is taught (definition and every
+	// entry) once the source announces a matching definition of it, and
+	// again whenever the source requests a resync, and is updated live
+	// as the store changes. Nothing is sent for a table the source has
+	// not announced. Output table names must differ from input names,
+	// and RequestResync must be set: stock HAProxy announces a table it
+	// never updates itself, as an output table, only while teaching.
+	Output *output.Store
 	// Heartbeat is the longest this side stays silent once established.
 	Heartbeat time.Duration
 	// IdleTimeout ends an established session after this long without a
@@ -131,6 +143,45 @@ type Stats struct {
 	SkippedUpdates  uint64
 	AcksSent        uint64
 	LastRx          time.Time
+	// EchoedUpdates counts updates of output tables received from the
+	// source (its copy of what this side published, replayed when it
+	// teaches): acknowledged, never delivered as events.
+	EchoedUpdates uint64
+	// Teaches counts teaches of the output sent: one per output table
+	// when the source first announces it, and one (of every announced
+	// table) per resync request from the source.
+	Teaches uint64
+	// OutputUpdates counts output entry updates sent; TaughtUpdates
+	// counts those sent by teaches, the rest were live changes.
+	OutputUpdates uint64
+	TaughtUpdates uint64
+	// AcksReceived counts acknowledgements of output updates.
+	AcksReceived uint64
+	// Outputs describes each output table, in local ID order.
+	Outputs []OutputStats
+}
+
+// OutputStats is one output table's state in a session.
+type OutputStats struct {
+	// Table is the output table name.
+	Table string
+	// LocalID is the ID this side announced the table under.
+	LocalID peermsg.LocalTableID
+	// SourceID is the ID under which the source announced its own
+	// definition of the table, which matched; 0 if it has not. Nothing
+	// is sent for a table before the source announces it, so a source
+	// that never does (it does not share the table with this peer)
+	// receives no output for it.
+	SourceID peermsg.RemoteTableID
+	// Sent counts updates sent for the table in this session; LastSent
+	// is the last one's ID.
+	Sent     uint64
+	LastSent peermsg.UpdateID
+	// Acked reports whether the source acknowledged any update of the
+	// table; LastAcked is the latest acknowledged ID. Acknowledgement is
+	// transport progress only: it is not proof that the values are fresh.
+	Acked     bool
+	LastAcked peermsg.UpdateID
 }
 
 // Conn is one peers connection. Create it with NewConn, complete the
@@ -149,6 +200,12 @@ type Conn struct {
 
 	in       *peermsg.Inbound
 	tables   map[peermsg.RemoteTableID]*tableState
+	local    *peermsg.LocalTables
+	outs     []*outTable // by local ID - 1
+	outNames map[string]*outTable
+	outSeq   uint64               // store sequence sent so far
+	outSel   peermsg.LocalTableID // table the last definition sent selected
+	obuf     []byte
 	confirms uint32
 	learn    LearnState
 	lastRx   time.Time
@@ -167,12 +224,47 @@ type Conn struct {
 	acksSent     atomic.Uint64
 	lastRxNano   atomic.Int64
 	nudgeAt      atomic.Int64 // UnixNano of a requested early heartbeat, or 0
+	echoed       atomic.Uint64
+	teaches      atomic.Uint64
+	outUpdates   atomic.Uint64
+	taught       atomic.Uint64
+	acksRecv     atomic.Uint64
+	outWake      atomic.Bool // the output store changed since the last send
+}
+
+// tableKind is how a session treats a table the source announced.
+type tableKind uint8
+
+const (
+	kindIgnored tableKind = iota // not shared with this side's purpose
+	kindInput                    // a configured input table
+	kindOutput                   // the source's copy of an output table
+)
+
+// outTable is one output table this session announces.
+type outTable struct {
+	id   peermsg.LocalTableID
+	def  peermsg.Definition
+	last peermsg.UpdateID // last update ID sent
+	sent uint64
+	// ready is set once the source announced a matching definition of
+	// the table; nothing is sent for it before.
+	ready bool
+	// taughtSeq is the store sequence the table's last teach was
+	// current to; publish skips entries no newer.
+	taughtSeq uint64
+
+	sourceID  atomic.Uint32
+	sentA     atomic.Uint64
+	lastSentA atomic.Uint32
+	acked     atomic.Bool
+	lastAcked atomic.Uint32
 }
 
 // tableState is this session's view of one table ID the source bound.
 type tableState struct {
 	name    string
-	input   bool
+	kind    tableKind
 	def     peermsg.Definition
 	pending peermsg.UpdateID // last update accepted by the sink
 	dirty   bool             // pending not yet acknowledged
@@ -208,7 +300,7 @@ func NewConn(nc net.Conn, opts Options) (*Conn, error) {
 	if opts.PID == 0 {
 		opts.PID = currentPID()
 	}
-	return &Conn{
+	c := &Conn{
 		nc:       nc,
 		opts:     opts,
 		dec:      dec,
@@ -216,7 +308,28 @@ func NewConn(nc net.Conn, opts Options) (*Conn, error) {
 		deadline: time.Now().Add(opts.HandshakeTimeout),
 		in:       peermsg.NewInbound(opts.MaxTables),
 		tables:   map[peermsg.RemoteTableID]*tableState{},
-	}, nil
+		outNames: map[string]*outTable{},
+	}
+	if opts.Output != nil {
+		if !opts.RequestResync {
+			return nil, errors.New("peersession: output needs RequestResync: the source announces output tables only when it teaches")
+		}
+		defs := opts.Output.Tables()
+		c.local = peermsg.NewLocalTables(len(defs))
+		for _, def := range defs {
+			if _, ok := opts.Tables[def.Name]; ok {
+				return nil, fmt.Errorf("peersession: output table %s is also an input table", def.Name)
+			}
+			id, err := c.local.Register(def)
+			if err != nil {
+				return nil, fmt.Errorf("peersession: output table: %w", err)
+			}
+			t := &outTable{id: id, def: def}
+			c.outs = append(c.outs, t)
+			c.outNames[def.Name] = t
+		}
+	}
+	return c, nil
 }
 
 func currentPID() uint32 {
@@ -240,9 +353,25 @@ func (c *Conn) Stats() Stats {
 		Updates:         c.updates.Load(),
 		SkippedUpdates:  c.skipped.Load(),
 		AcksSent:        c.acksSent.Load(),
+		EchoedUpdates:   c.echoed.Load(),
+		Teaches:         c.teaches.Load(),
+		OutputUpdates:   c.outUpdates.Load(),
+		TaughtUpdates:   c.taught.Load(),
+		AcksReceived:    c.acksRecv.Load(),
 	}
 	if n := c.lastRxNano.Load(); n != 0 {
 		s.LastRx = time.Unix(0, n)
+	}
+	for _, t := range c.outs {
+		s.Outputs = append(s.Outputs, OutputStats{
+			Table:     t.def.Name,
+			LocalID:   t.id,
+			SourceID:  peermsg.RemoteTableID(t.sourceID.Load()),
+			Sent:      t.sentA.Load(),
+			LastSent:  peermsg.UpdateID(t.lastSentA.Load()),
+			Acked:     t.acked.Load(),
+			LastAcked: peermsg.UpdateID(t.lastAcked.Load()),
+		})
 	}
 	return s
 }
@@ -314,6 +443,9 @@ func (c *Conn) fill(ctx context.Context, deadline time.Time) error {
 	}
 	if at := c.nudgeAt.Load(); at != 0 && at <= time.Now().UnixNano() {
 		return errDeadline // a Nudge fired before this deadline was set
+	}
+	if c.outWake.Load() {
+		return errDeadline // the output changed before this deadline was set
 	}
 	n, err := c.nc.Read(c.buf[:min(len(c.buf), c.dec.Free())])
 	if n > 0 {

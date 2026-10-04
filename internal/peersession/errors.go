@@ -20,9 +20,9 @@ var (
 	// size-limit error message before ending.
 	ErrProtocol = errors.New("peersession: protocol violation")
 
-	// ErrSchema: an input table's definition is outside the supported
-	// subset or differs from its configured schema.
-	ErrSchema = errors.New("peersession: input table schema mismatch")
+	// ErrSchema: an input or output table's definition is outside the
+	// supported subset or differs from its configured schema.
+	ErrSchema = errors.New("peersession: table schema mismatch")
 
 	// ErrLimit: the source exceeded a configured resource bound, such as
 	// the number of tables one session may bind.

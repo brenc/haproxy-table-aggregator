@@ -57,6 +57,9 @@ func (c *Conn) Run(ctx context.Context, sink Sink) (err error) {
 		}
 		c.setLearn(LearnRequested)
 	}
+	if c.opts.Output != nil {
+		defer c.watchOutput(ctx)()
+	}
 	for {
 		if perr := c.process(ctx, sink); perr != nil {
 			return c.fail(ctx, perr)
@@ -69,6 +72,11 @@ func (c *Conn) Run(ctx context.Context, sink Sink) (err error) {
 		}
 		if err := c.flushAcks(ctx); err != nil {
 			return err
+		}
+		if c.outWake.Swap(false) {
+			if err := c.publish(ctx); err != nil {
+				return err
+			}
 		}
 		if err := c.tick(ctx, time.Now()); err != nil {
 			return err
@@ -153,7 +161,7 @@ func (c *Conn) process(ctx context.Context, sink Sink) error {
 func (c *Conn) handle(ctx context.Context, f peerwire.Frame, sink Sink) error {
 	if f.Class == peerwire.ClassStickTable && peermsg.IsUpdateType(f.Type) {
 		if id, ok := c.in.Selected(); ok {
-			if t := c.tables[id]; t != nil && !t.input {
+			if t := c.tables[id]; t != nil && t.kind == kindIgnored {
 				c.skipped.Add(1)
 				return nil
 			}
@@ -175,7 +183,7 @@ func (c *Conn) handle(ctx context.Context, f peerwire.Frame, sink Sink) error {
 	case peermsg.UpdateMessage:
 		return c.update(ctx, m, sink)
 	case peermsg.AckMessage:
-		return protocol("acknowledgement for local table %d, but this session announced no tables", m.ID)
+		return c.ack(m)
 	default:
 		return protocol("unexpected message %T", msg)
 	}
@@ -201,31 +209,55 @@ func (c *Conn) decodeError(ctx context.Context, f peerwire.Frame, err error) err
 // or rejected by peermsg. HAProxy re-sends a table's definition to switch
 // back to it, so an identical redefinition changes nothing and is not
 // reported again.
+//
+// An input table must match its configured spec, and the source's copy of
+// an output table must match the definition this side announces for it
+// (same key, expiry, and gpt length), so that a misconfigured output table
+// is found instead of silently dropping slots; either mismatch ends the
+// session with ErrSchema. Every other table is ignored.
 func (c *Conn) define(ctx context.Context, id peermsg.RemoteTableID, def peermsg.Definition, rejected error,
 	sink Sink,
 ) error {
-	spec, input := c.opts.Tables[def.Name]
-	if input {
+	kind := kindIgnored
+	if spec, ok := c.opts.Tables[def.Name]; ok {
+		kind = kindInput
 		if rejected != nil {
 			return wrapCause(ErrSchema, rejected, "input table %s", def.Name)
 		}
 		if err := checkSpec(def, spec); err != nil {
 			return err
 		}
+	} else if out := c.outNames[def.Name]; out != nil {
+		kind = kindOutput
+		if rejected != nil {
+			return wrapCause(ErrSchema, rejected, "output table %s", def.Name)
+		}
+		if !sameDefinition(def, out.def) {
+			return wrap(ErrSchema, "output table %s: source stores %v expiring after %v, this side publishes %v expiring after %v",
+				def.Name, def.Fields, def.Expiry, out.def.Fields, out.def.Expiry)
+		}
 	}
-	if old := c.tables[id]; old != nil && old.name == def.Name && old.input == input &&
-		(!input || sameDefinition(old.def, def)) {
+	if old := c.tables[id]; old != nil && old.name == def.Name && old.kind == kind &&
+		(kind == kindIgnored || sameDefinition(old.def, def)) {
 		return nil
 	}
 	if err := c.unbind(ctx, id, def.Name); err != nil {
 		return err
 	}
-	c.tables[id] = &tableState{name: def.Name, input: input, def: def}
-	if !input {
-		return nil
-	}
-	if err := sink(ctx, TableDefined{ID: id, Definition: def, Received: c.rxTime}); err != nil {
-		return wrapCause(ErrEventRejected, err, "definition of %s", def.Name)
+	c.tables[id] = &tableState{name: def.Name, kind: kind, def: def}
+	switch kind {
+	case kindInput:
+		if err := sink(ctx, TableDefined{ID: id, Definition: def, Received: c.rxTime}); err != nil {
+			return wrapCause(ErrEventRejected, err, "definition of %s", def.Name)
+		}
+	case kindOutput:
+		out := c.outNames[def.Name]
+		out.sourceID.Store(uint32(id))
+		if !out.ready {
+			out.ready = true
+			return c.teachTable(ctx, out)
+		}
+	case kindIgnored:
 	}
 	return nil
 }
@@ -242,6 +274,9 @@ func (c *Conn) unbind(ctx context.Context, id peermsg.RemoteTableID, name string
 			if err := c.sendAck(ctx, oldID, t); err != nil {
 				return err
 			}
+		}
+		if t.kind == kindOutput {
+			c.outNames[t.name].sourceID.CompareAndSwap(uint32(oldID), 0)
 		}
 		delete(c.tables, oldID)
 	}
@@ -275,10 +310,18 @@ func checkSpec(def peermsg.Definition, spec TableSpec) error {
 
 func (c *Conn) update(ctx context.Context, m peermsg.UpdateMessage, sink Sink) error {
 	t := c.tables[m.ID]
-	if t == nil || !t.input {
+	if t == nil || t.kind == kindIgnored {
 		// Inbound only decodes updates for a selected, accepted table,
-		// and handle skips non-input tables, so this cannot happen.
+		// and handle skips ignored tables, so this cannot happen.
 		return protocol("update for unbound table %d", m.ID)
+	}
+	if t.kind == kindOutput {
+		// The source's copy of what this side published, typically
+		// replayed when it teaches: acknowledged so that its cursor
+		// advances, but never an input contribution.
+		t.pending, t.dirty = m.Update.ID, true
+		c.echoed.Add(1)
+		return nil
 	}
 	ev := EntryUpdated{ID: m.ID, Table: t.name, Expiry: t.def.Expiry, Update: m.Update}
 	if err := sink(ctx, ev); err != nil {
@@ -295,7 +338,12 @@ func (c *Conn) control(ctx context.Context, typ peerwire.MessageType, sink Sink)
 		c.rxHeartbeats.Add(1)
 		return nil
 	case peerwire.ControlResyncRequest:
-		// This side announces no tables, so it has nothing to teach.
+		// Teach the whole output (nothing without one), then finish.
+		if c.opts.Output != nil {
+			if err := c.teach(ctx); err != nil {
+				return err
+			}
+		}
 		if err := c.sendControl(ctx, peerwire.ControlResyncFinished); err != nil {
 			return err
 		}
