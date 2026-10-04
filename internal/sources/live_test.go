@@ -59,8 +59,10 @@ type peerState struct {
 	Active bool
 	Status string
 	Fields map[string]string
-	// Tables maps a table name to its per-peer cursor fields
-	// (last_acked, last_pushed, last_get, teaching_origin, update).
+	// Tables maps a table name to its per-peer fields: HAProxy's own
+	// table ID (local_id), the ID the aggregator announced for it
+	// (remote_id, 0 if none), and the cursor (last_acked, last_pushed,
+	// last_get, teaching_origin, update).
 	Tables map[string]map[string]string
 }
 
@@ -100,8 +102,12 @@ func showPeer(t *testing.T, n *lab.Node) peerState {
 			continue
 		}
 		kvs := kvRE.FindAllStringSubmatch(line, -1)
-		if strings.Contains(line, "last_acked=") {
-			cursor = map[string]string{}
+		// A shared table is three lines: its IDs (local_id ...
+		// remote_data=), its cursor (last_acked=...), and its name.
+		if strings.Contains(line, "remote_data=") || strings.Contains(line, "last_acked=") {
+			if cursor == nil {
+				cursor = map[string]string{}
+			}
 			for _, kv := range kvs {
 				cursor[kv[1]] = kv[2]
 			}

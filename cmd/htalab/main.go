@@ -80,7 +80,7 @@ func run(args []string, out io.Writer) (err error) {
 		_, _ = fmt.Fprintf(out, "node %s pid=%d lab=%s prod=%s prod6=%s proxy=%s runtime=%s",
 			n.Name, n.PID(), n.LabAddr, n.ProdAddr4, n.ProdAddr6, n.ProxyAddr, n.Socket)
 		if n.PeersAddr != "" {
-			_, _ = fmt.Fprintf(out, " peers=%s", n.PeersAddr)
+			_, _ = fmt.Fprintf(out, " peers=%s probe=%s", n.PeersAddr, n.ProbeAddr)
 		}
 		_, _ = fmt.Fprintln(out)
 	}
@@ -107,12 +107,14 @@ func run(args []string, out io.Writer) (err error) {
 }
 
 // writeHtadConfig writes an htad configuration for the lab: both nodes
-// dial the daemon, and the daemon also dials node b.
+// dial the daemon, and the daemon also dials node b. It names the lab's
+// input table and both output tables.
 func writeHtadConfig(path string, l *lab.Lab, agg *lab.Aggregator) error {
 	a, b := l.Node("a"), l.Node("b")
 	if a == nil || b == nil {
 		return errors.New("-htad-config needs nodes a and b")
 	}
+	expire := (lab.ExpiryFactor * l.Period).String()
 	doc := map[string]any{
 		"local_peer":                      agg.Name,
 		"insecure_plaintext_loopback_lab": true,
@@ -122,6 +124,10 @@ func writeHtadConfig(path string, l *lab.Lab, agg *lab.Aggregator) error {
 			{"name": b.Name, "address": b.PeersAddr},
 		},
 		"tables": []map[string]string{{"name": lab.LabTable, "period": l.Period.String()}},
+		"outputs": []map[string]string{
+			{"name": lab.OutputTable, "kind": "aggregate", "expire": expire},
+			{"name": lab.MetaTable, "kind": "metadata", "expire": expire},
+		},
 	}
 	buf, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

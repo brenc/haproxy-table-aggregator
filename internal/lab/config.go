@@ -20,6 +20,24 @@ const (
 	ProxyTable = "proxy_in"
 )
 
+// Output tables, present only when the lab has an aggregator, which
+// writes them over the peers protocol. No request rule tracks them; only
+// the probe listener reads them. Both store gpt(4) (output schema
+// version 1, package output) and expire like the input tables.
+const (
+	// OutputTable is the aggregate output table, keyed like LabTable.
+	OutputTable = "lab_out"
+	// MetaTable is the metadata table, with one entry under ::.
+	MetaTable = "lab_meta"
+	// OutputSlots is the gpt array length of both output tables.
+	OutputSlots = 4
+)
+
+// OutputLimit is the probe listener's ACL threshold: a lookup whose
+// output entry carries schema version 1 and a rate at or above it is
+// answered 429, any other 200.
+const OutputLimit = 1000
+
 // HTTP headers exchanged between the harness, HAProxy, and the responder.
 const (
 	// ClientHeader carries the synthetic client address on the lab listener.
@@ -38,6 +56,13 @@ const (
 	// LookupHeader is set by HAProxy on the response to the http_req_cnt it
 	// looks up with the same key expression used for tracking.
 	LookupHeader = "X-Lab-Lookup-Cnt"
+	// OutVersionHeader, OutRateHeader, and MetaVersionHeader are set by
+	// the probe listener to table_gpt lookups: slots 0 and 1 of the
+	// OutputTable entry for the probed key, and slot 0 of the MetaTable
+	// entry ::. A missing entry reads 0.
+	OutVersionHeader  = "X-Lab-Out-Version"
+	OutRateHeader     = "X-Lab-Out-Rate"
+	MetaVersionHeader = "X-Lab-Meta-Version"
 )
 
 // ExpiryFactor is how many rate periods a table entry outlives its last
@@ -64,10 +89,23 @@ type configParams struct {
 	ListenerHdr string
 	KeyHdr      string
 	LookupHdr   string
+	// Probe response headers.
+	OutVersionHdr  string
+	OutRateHdr     string
+	MetaVersionHdr string
 	// Aggregator peers section; empty AggName means none.
 	AggName   string
 	AggAddr   string
 	PeersBind string
+	// With an aggregator: the output tables, declared before the input
+	// tables when OutputFirst (which changes HAProxy's table IDs), and
+	// the probe listener.
+	OutputFirst bool
+	ProbeBind   string
+	OutTable    string
+	MetaTable   string
+	OutSlots    int
+	OutLimit    int
 }
 
 // The key expression is stored once in txn.lab_key and reused for tracking,
@@ -102,6 +140,8 @@ peers agg
     server {{.AggName}} {{.AggAddr}}
 {{- end}}
 
+{{- if .OutputFirst}}{{template "outputs" .}}{{end}}
+
 backend {{.LabTable}}
     stick-table type ipv6 size 1k expire {{.ExpireMS}} store http_req_cnt,http_req_rate({{.PeriodMS}}){{if .AggName}} peers agg{{end}}
 
@@ -110,6 +150,7 @@ backend {{.ProdTable}}
 
 backend {{.ProxyTable}}
     stick-table type ipv6 size 1k expire {{.ExpireMS}} store http_req_cnt,http_req_rate({{.PeriodMS}}){{if .AggName}} peers agg{{end}}
+{{- if and .AggName (not .OutputFirst)}}{{template "outputs" .}}{{end}}
 
 # Isolated lab listener: the synthetic client header is trusted here only.
 frontend lab
@@ -153,8 +194,32 @@ frontend proxy
     http-after-response set-header {{.KeyHdr}} %[var(txn.lab_key)]
     default_backend responder
 
+{{- if .AggName}}
+
+# Output probe: answers from the aggregator's output with ordinary
+# table_gpt lookups and an ACL. It tracks nothing, so probing never
+# changes an input table.
+frontend probe
+    bind {{.ProbeBind}}
+    http-request set-var(txn.lab_key) req.hdr_ip({{.ClientHdr}}),ipmask(32,64) if { req.hdr_cnt({{.ClientHdr}}) eq 1 }
+    http-request deny deny_status 400 unless { var(txn.lab_key) -m found }
+    acl out_v1 var(txn.lab_key),table_gpt(0,{{.OutTable}}) eq 1
+    acl out_over var(txn.lab_key),table_gpt(1,{{.OutTable}}) ge {{.OutLimit}}
+    http-request return status 429 hdr {{.KeyHdr}} "%[var(txn.lab_key)]" hdr {{.OutVersionHdr}} "%[var(txn.lab_key),table_gpt(0,{{.OutTable}})]" hdr {{.OutRateHdr}} "%[var(txn.lab_key),table_gpt(1,{{.OutTable}})]" hdr {{.MetaVersionHdr}} "%[ipv6(::),table_gpt(0,{{.MetaTable}})]" if out_v1 out_over
+    http-request return status 200 hdr {{.KeyHdr}} "%[var(txn.lab_key)]" hdr {{.OutVersionHdr}} "%[var(txn.lab_key),table_gpt(0,{{.OutTable}})]" hdr {{.OutRateHdr}} "%[var(txn.lab_key),table_gpt(1,{{.OutTable}})]" hdr {{.MetaVersionHdr}} "%[ipv6(::),table_gpt(0,{{.MetaTable}})]"
+{{- end}}
+
 backend responder
     server responder {{.Responder}}
+{{- define "outputs"}}
+
+# Output tables, written only by the aggregator over the peers protocol.
+backend {{.OutTable}}
+    stick-table type ipv6 size 1k expire {{.ExpireMS}} store gpt({{.OutSlots}}) peers agg
+
+backend {{.MetaTable}}
+    stick-table type ipv6 size 16 expire {{.ExpireMS}} store gpt({{.OutSlots}}) peers agg
+{{- end}}
 `))
 
 func renderConfig(p configParams) ([]byte, error) {

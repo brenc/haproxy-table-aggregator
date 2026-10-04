@@ -133,6 +133,54 @@ func (c *Client) Send(ctx context.Context, addr, clientIP string) (Response, err
 	return resp, nil
 }
 
+// ProbeResponse is the output probe listener's answer for one key: what
+// stock HAProxy's table_gpt lookups and ACL saw in the output tables.
+type ProbeResponse struct {
+	// Status is 429 when the ACL matched (schema version 1 and a rate at
+	// or above OutputLimit), 200 otherwise.
+	Status int
+	// Key is the key HAProxy looked up.
+	Key string
+	// Version and Rate are slots 0 and 1 of the OutputTable entry; both
+	// read 0 for a missing entry.
+	Version, Rate int64
+	// MetaVersion is slot 0 of the MetaTable entry ::.
+	MetaVersion int64
+}
+
+// Probe asks a node's probe listener (Node.ProbeAddr) what HAProxy's
+// ordinary output lookups return for clientIP's key. Probing tracks
+// nothing.
+func (c *Client) Probe(ctx context.Context, addr, clientIP string) (ProbeResponse, error) {
+	var out ProbeResponse
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/", http.NoBody)
+	if err != nil {
+		return out, err
+	}
+	req.Header.Set(ClientHeader, clientIP)
+	res, err := c.http.Do(req)
+	if err != nil {
+		return out, fmt.Errorf("probe: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if _, err := io.Copy(io.Discard, io.LimitReader(res.Body, 1<<16)); err != nil {
+		return out, fmt.Errorf("probe body: %w", err)
+	}
+	out.Status, out.Key = res.StatusCode, res.Header.Get(KeyHeader)
+	for _, f := range []struct {
+		hdr string
+		dst *int64
+	}{{OutVersionHeader, &out.Version}, {OutRateHeader, &out.Rate}, {MetaVersionHeader, &out.MetaVersion}} {
+		v := res.Header.Get(f.hdr)
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return out, fmt.Errorf("probe: status %d, bad %s %q: %w", res.StatusCode, f.hdr, v, err)
+		}
+		*f.dst = n
+	}
+	return out, nil
+}
+
 // SendN issues n sequential requests and returns the responses received.
 // It stops at the first transport error or non-200 status.
 func (c *Client) SendN(ctx context.Context, addr, clientIP string, n int) ([]Response, error) {
