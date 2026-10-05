@@ -33,6 +33,12 @@ and drives local HAProxy decisions without a per-request aggregator call.
   `aggregate.Total.Complete` does for counts). `Uncertain` (a count
   decrease or a held-over prior-session entry) is not an error, but keep
   it visible in diagnostics rather than dropping it.
+- Carried in from phase 09: publish only `aggregate.RateTotal.Authoritative()`
+  values; an error, including `ErrOverflow`, means no certified value.
+  `output.RateValue` still saturates (phase 05 called that safe because it
+  only restricts); reconcile the two, and never use a saturated value to
+  certify authority. Reevaluate keys at `Cadence.Due` and also on source
+  state changes, which `RateTotal.Next` does not include.
 
 ## Acceptance
 

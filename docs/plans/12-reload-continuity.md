@@ -23,6 +23,10 @@ reloads using a bounded, repeatable experiment under traffic.
   Reapply the phase-06 tests against genuine worker handover.
 - Run pinned unmodified upstream targets separately. A patched local binary
   may help isolate an upstream defect but cannot satisfy this gate.
+- Carried in from phase 09 review: in 3.4.6 the rate clock
+  `global_now_ms` is read through a pointer that can point into the shared
+  stats file (`stats-file.c`), unlike 3.2.25. Check whether that changes
+  counter ages or rotation across a reload.
 
 ## Acceptance
 
