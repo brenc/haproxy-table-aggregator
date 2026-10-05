@@ -186,7 +186,7 @@ func OptionsFrom(cfg config.Config) Options {
 		o.Sources = append(o.Sources, s.Name)
 	}
 	for _, t := range cfg.Tables {
-		//nolint:gosec // G115: config.Validate bounds periods to 1ms..MaxUint32 ms.
+		//nolint:gosec // G115: config.Validate bounds periods to 1ms..MaxInt32 ms.
 		o.Tables = append(o.Tables, Table{Name: t.Name, Period: peermsg.Millis(t.Period.Milliseconds())})
 	}
 	return o

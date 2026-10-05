@@ -529,9 +529,9 @@ func TestCompleteness(t *testing.T) {
 	h.want(k, 70, true)
 }
 
-// TestRandomTraces compares the total with the oracle after random
-// steps across both tables: updates with random (also decreasing and
-// boundary) counts, timed replays, partial and finished resyncs,
+// TestRandomTraces compares the total and the rate with the oracle after
+// random steps across both tables: updates with random (also decreasing
+// and boundary) counts and random rate counters, timed replays, partial and finished resyncs,
 // reconnects, heartbeats, clock advances across health and expiry
 // bounds, and the events the store refuses or reports as faults:
 // duplicate SessionUp, events of an earlier session, a definition with
@@ -550,7 +550,7 @@ func TestRandomTraces(t *testing.T) {
 	causes := []error{
 		snapshot.ErrSession, snapshot.ErrSchema, snapshot.ErrNotInput, snapshot.ErrUndefined, snapshot.ErrCapacity,
 	}
-	var dupUps, staleEvents, rejected, degradedRetained, uncertainComplete, nonzero2 int
+	var dupUps, staleEvents, rejected, degradedRetained, uncertainComplete, nonzero2, nonzeroRates int
 	for seed := range uint64(40) {
 		rng := rand.New(rand.NewPCG(seed, 8))
 		// Capacity 4 of the 6 key/table slots, so new keys are refused.
@@ -616,9 +616,12 @@ func TestRandomTraces(t *testing.T) {
 			case r < 42:
 				u := h.upd(table, id, k, randCount(rng))
 				u.Update.Timed, u.Update.Remaining = true, peermsg.Millis(rng.IntN(int(expiry)+5000))
+				u.Update.Values[1].Freq = randFreq(rng)
 				try(src, session[src], u)
 			case r < 70:
-				try(src, session[src], h.upd(table, id, k, randCount(rng)))
+				u := h.upd(table, id, k, randCount(rng))
+				u.Update.Values[1].Freq = randFreq(rng)
+				try(src, session[src], u)
 			case r < 80:
 				h.observe(src, session[src])
 			default:
@@ -635,6 +638,9 @@ func TestRandomTraces(t *testing.T) {
 			for _, k := range ks {
 				for _, table := range tables {
 					tot := h.total(table, k)
+					if r := h.rate(table, k); r.Sum > 0 && r.Complete {
+						nonzeroRates++
+					}
 					for _, c := range tot.Sources {
 						if c.Present && c.State == snapshot.Degraded {
 							degradedRetained++
@@ -651,8 +657,8 @@ func TestRandomTraces(t *testing.T) {
 		}
 	}
 	t.Logf("refusals %v; duplicate ups %d, earlier-session events %d, rejections %d; reads with a degraded "+
-		"source's retained entry %d, complete but uncertain %d, non-zero %s totals %d", refusals, dupUps,
-		staleEvents, rejected, degradedRetained, uncertainComplete, inTable2, nonzero2)
+		"source's retained entry %d, complete but uncertain %d, non-zero %s totals %d, non-zero complete rates %d", refusals,
+		dupUps, staleEvents, rejected, degradedRetained, uncertainComplete, inTable2, nonzero2, nonzeroRates)
 	for _, c := range causes {
 		if refusals[c] == 0 {
 			t.Errorf("no refusal wrapping %v", c)
@@ -661,7 +667,7 @@ func TestRandomTraces(t *testing.T) {
 	for what, n := range map[string]int{
 		"duplicate SessionUp": dupUps, "earlier-session event": staleEvents, "TableRejected": rejected,
 		"degraded source with a retained entry": degradedRetained, "complete uncertain total": uncertainComplete,
-		"non-zero " + inTable2 + " total": nonzero2,
+		"non-zero " + inTable2 + " total": nonzero2, "non-zero complete rate": nonzeroRates,
 	} {
 		if n == 0 {
 			t.Errorf("trace never produced a %s", what)

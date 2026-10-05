@@ -108,6 +108,7 @@ func TestInvalid(t *testing.T) {
 		"duplicate table":          edit(`[{"name": "lab_in", "period": "10s"}]`, `[{"name": "x", "period": "1s"}, {"name": "x", "period": "1s"}]`),
 		"table without period":     edit(`{"name": "lab_in", "period": "10s"}`, `{"name": "lab_in"}`),
 		"sub-millisecond period":   edit(`"10s"`, `"1500us"`),
+		"period over 2^31-1 ms":    edit(`"10s"`, `"2147483648ms"`),
 		"bad duration":             edit(`"10s"`, `"ten seconds"`),
 		"numeric duration":         edit(`"10s"`, `10`),
 		"bad table name":           edit(`"lab_in"`, `"lab in"`),

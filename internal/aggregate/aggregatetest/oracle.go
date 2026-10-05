@@ -1,13 +1,15 @@
 // Package aggregatetest provides an independent trace oracle for the
-// diagnostic totals of package aggregate, for tests only.
+// diagnostic totals and aggregate rates of package aggregate, for tests
+// only.
 //
 // The Oracle records the events a snapshot store accepted or refused and
 // the message reads observed for heartbeats, and recomputes from that
 // trace, using the rules the plan states rather than any production code,
 // which value each source holds for a key, which sources are ready, and
-// what the total therefore must be. It deliberately calls neither the
-// snapshot store's merge nor aggregate.Count: a test compares their
-// result with Want.
+// what the total and rate therefore must be. It deliberately calls none
+// of the snapshot store's merge, aggregate.Count, aggregate.Rate, or
+// package rate (rates come from the reference in package ratetest): a
+// test compares their results with Want and WantRate.
 package aggregatetest
 
 import (
@@ -17,6 +19,7 @@ import (
 
 	"github.com/brenc/haproxy-table-aggregator/internal/peermsg"
 	"github.com/brenc/haproxy-table-aggregator/internal/peersession"
+	"github.com/brenc/haproxy-table-aggregator/internal/rate/ratetest"
 	"github.com/brenc/haproxy-table-aggregator/internal/sources"
 )
 
@@ -90,6 +93,8 @@ type Expectation struct {
 
 type value struct {
 	count    uint32
+	rate     peermsg.FreqCounter
+	received time.Time
 	deadline time.Time
 	session  uint64
 	lowered  bool
@@ -105,9 +110,65 @@ type source struct {
 	values  map[string]map[peermsg.Key]value
 }
 
+// RateExpectation is what the oracle expects of one key's aggregate
+// rate.
+type RateExpectation struct {
+	// Sum is the sum of the counted estimates.
+	Sum uint64
+	// Complete reports every roster source ready.
+	Complete bool
+	// Uncertain reports a counted value held over from an earlier
+	// session, or a non-empty counter whose wire age exceeded the period
+	// plus 2^31 ms.
+	Uncertain bool
+	// Counted maps each ready source holding a value to its estimate.
+	Counted map[string]uint64
+}
+
 // Want returns the expectation for table and key at now, for the roster
 // of configured source names.
 func (o *Oracle) Want(roster []string, table string, key peermsg.Key, now time.Time) Expectation {
+	x := Expectation{Complete: true, Counted: map[string]uint32{}}
+	o.visit(roster, table, key, now, func(name string, s *source, v value, ok bool) {
+		if !ok {
+			x.Complete = false
+			return
+		}
+		x.Counted[name] = v.count
+		x.Sum += uint64(v.count)
+		x.Uncertain = x.Uncertain || v.lowered || v.session < s.session
+	})
+	return x
+}
+
+// WantRate returns the expectation for the aggregate rate of table and
+// key at now, for the roster: each ready source's latest value evaluated
+// at now by the reference reading of package ratetest for period (ms),
+// then summed.
+func (o *Oracle) WantRate(roster []string, table string, key peermsg.Key, period uint32, now time.Time,
+) RateExpectation {
+	x := RateExpectation{Complete: true, Counted: map[string]uint64{}}
+	o.visit(roster, table, key, now, func(name string, s *source, v value, ok bool) {
+		if !ok {
+			x.Complete = false
+			return
+		}
+		est := ratetest.ReadReceived(v.rate, period, v.received, now)
+		x.Counted[name] = est
+		x.Sum += est
+		// Upstream's signed remainder P - age is exact down to -2^31.
+		outOfRange := (v.rate.Curr != 0 || v.rate.Prev != 0) && int64(v.rate.Age)-int64(period) > 1<<31
+		x.Uncertain = x.Uncertain || v.session < s.session || outOfRange
+	})
+	return x
+}
+
+// visit replays the trace and calls fn for every roster source, in roster
+// order: with ok false for a source that is not ready at now, else with
+// its unexpired value of table and key, if it holds one.
+func (o *Oracle) visit(roster []string, table string, key peermsg.Key, now time.Time,
+	fn func(name string, s *source, v value, ok bool),
+) {
 	o.mu.Lock()
 	trace := append([]record(nil), o.trace...)
 	o.mu.Unlock()
@@ -121,7 +182,6 @@ func (o *Oracle) Want(roster []string, table string, key peermsg.Key, now time.T
 			s.replay(r, o.Tables)
 		}
 	}
-	x := Expectation{Complete: true, Counted: map[string]uint32{}}
 	for _, name := range roster {
 		s := srcs[name]
 		ready := s.up && s.synced && !s.fault && now.Sub(s.lastRx) < o.Health
@@ -129,16 +189,13 @@ func (o *Oracle) Want(roster []string, table string, key peermsg.Key, now time.T
 			ready = ready && s.defined[t]
 		}
 		if !ready {
-			x.Complete = false
+			fn(name, s, value{}, false)
 			continue
 		}
 		if v, ok := s.values[table][key]; ok && now.Before(v.deadline) {
-			x.Counted[name] = v.count
-			x.Sum += uint64(v.count)
-			x.Uncertain = x.Uncertain || v.lowered || v.session < s.session
+			fn(name, s, v, true)
 		}
 	}
-	return x
 }
 
 func (s *source) seen(at time.Time) {
@@ -223,12 +280,17 @@ func (s *source) update(session uint64, b peersession.EntryUpdated) {
 		return
 	}
 	var count uint32
+	var rate peermsg.FreqCounter
 	for _, v := range u.Values {
-		if v.Type == peermsg.DataHTTPReqCnt {
+		switch v.Type {
+		case peermsg.DataHTTPReqCnt:
 			count = v.Uint
+		case peermsg.DataHTTPReqRate:
+			rate = v.Freq
+		default:
 		}
 	}
-	v := value{count: count, deadline: u.Received.Add(time.Duration(life) * time.Millisecond), session: session}
+	v := value{count: count, rate: rate, received: u.Received, deadline: u.Received.Add(time.Duration(life) * time.Millisecond), session: session}
 	if old, ok := s.values[b.Table][u.Key]; ok && u.Received.Before(old.deadline) {
 		v.lowered = old.lowered || count < old.count
 	}

@@ -176,7 +176,8 @@ type Source struct {
 type Table struct {
 	// Name is the stick-table name.
 	Name string
-	// Period is the http_req_rate period the table must announce.
+	// Period is the http_req_rate period the table must announce: whole
+	// milliseconds from 1 ms to math.MaxInt32 ms.
 	Period time.Duration
 }
 
@@ -448,8 +449,11 @@ func (c *Config) addTables(tables []FileTable) error {
 			return invalid("tables[%d].period: required", i)
 		}
 		p := time.Duration(*t.Period)
-		if p < time.Millisecond || p%time.Millisecond != 0 || p.Milliseconds() > math.MaxUint32 {
-			return invalid("tables[%d].period: %v must be whole milliseconds from 1ms to %d ms", i, p, uint64(math.MaxUint32))
+		// HAProxy evaluates the rest of a period as a signed 32-bit
+		// millisecond count, so longer periods have no defined reading
+		// (package rate).
+		if p < time.Millisecond || p%time.Millisecond != 0 || p.Milliseconds() > math.MaxInt32 {
+			return invalid("tables[%d].period: %v must be whole milliseconds from 1ms to %d ms", i, p, math.MaxInt32)
 		}
 		c.Tables = append(c.Tables, Table{Name: t.Name, Period: p})
 	}

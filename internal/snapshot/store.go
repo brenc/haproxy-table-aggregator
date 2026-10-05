@@ -436,13 +436,20 @@ func (s *Store) KeyView(tableName string, key peermsg.Key) (r Roster, contributi
 	return r, contributions, true
 }
 
-func (s *Store) isTable(name string) bool {
+// Table returns the configured input table named name. The configuration
+// is fixed at New, so no lock is needed.
+func (s *Store) Table(name string) (Table, bool) {
 	for _, t := range s.tables {
 		if t.Name == name {
-			return true
+			return t, true
 		}
 	}
-	return false
+	return Table{}, false
+}
+
+func (s *Store) isTable(name string) bool {
+	_, ok := s.Table(name)
+	return ok
 }
 
 // roster reports every source at now, after removing expired entries.

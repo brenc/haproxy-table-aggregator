@@ -11,7 +11,7 @@
 - [x] [06 — Freshness feasibility gate](06-freshness-gate.md)
 - [x] [07 — Source snapshots](07-source-snapshots.md)
 - [x] [08 — Counter aggregation](08-counter-aggregation.md)
-- [ ] [09 — Rate evaluation](09-rate-evaluation.md)
+- [x] [09 — Rate evaluation](09-rate-evaluation.md)
 - [ ] [10 — Publication and enforcement](10-publication-enforcement.md)
 - [ ] [11 — Restart and reconnect recovery](11-recovery.md)
 - [ ] [12 — Reload continuity gate](12-reload-continuity.md)

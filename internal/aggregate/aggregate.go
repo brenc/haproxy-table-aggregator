@@ -1,16 +1,29 @@
-// Package aggregate sums the sources' current http_req_cnt snapshots for
-// one key into a diagnostic total.
+// Package aggregate combines the sources' current snapshots of one key:
+// Count sums their http_req_cnt values into a diagnostic total, and Rate
+// sums their http_req_rate estimates into the aggregate rate.
 //
 // # Scope
 //
-// The total is a diagnostic for snapshot correctness. It is not a billing
-// count, a quota, or a durable or lifetime request total, and must not be
-// published or enforced as one. It is the sum of the values the sources'
-// stick-table entries hold right now, as the snapshot store last accepted
-// them. It forgets everything an entry counted once the entry expires at
-// its source or here, is evicted, or is reset; it is lost on restart; and
-// it inherits HAProxy's 32-bit per-entry counter. The rate that later
-// phases publish is evaluated separately from http_req_rate.
+// The count total is a diagnostic for snapshot correctness. It is not a
+// billing count, a quota, or a durable or lifetime request total, and
+// must not be published or enforced as one. It is the sum of the values
+// the sources' stick-table entries hold right now, as the snapshot store
+// last accepted them. It forgets everything an entry counted once the
+// entry expires at its source or here, is evicted, or is reset; it is lost
+// on restart; and it inherits HAProxy's 32-bit per-entry counter.
+//
+// # Rates
+//
+// Rate evaluates each Ready source's retained http_req_rate counter at
+// one common local time, the store clock's reading of the view, as the
+// native integer reading HAProxy would give for it (package rate), and
+// sums those integers. Raw counter fields are never added across
+// sources: their periods start at different times. The unit is estimated
+// requests per configured period. Evaluating later with no new input
+// decays the result, and RateTotal.Next says when it next changes, so a
+// publisher can reevaluate without waiting for updates (Cadence bounds how
+// often). Only a Complete rate may be published as authoritative, and only
+// if it fits the 32-bit output slot (RateTotal.Authoritative).
 //
 // # Arithmetic
 //
