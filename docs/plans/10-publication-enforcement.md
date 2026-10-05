@@ -28,6 +28,11 @@ and drives local HAProxy decisions without a per-request aggregator call.
   `snapshot.Store.Roster()`. Heartbeats reach the store only through polled
   `Observe`/`ObserveStatus` (htad polls every 250 ms), so call
   `ObserveStatus` immediately before deriving a lease from `Roster()`.
+- Carried in from phase 08: publish nothing as authoritative unless roster
+  readiness, read with the values, certifies every required source (as
+  `aggregate.Total.Complete` does for counts). `Uncertain` (a count
+  decrease or a held-over prior-session entry) is not an error, but keep
+  it visible in diagnostics rather than dropping it.
 
 ## Acceptance
 

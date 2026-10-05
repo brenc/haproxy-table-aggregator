@@ -26,6 +26,11 @@ results, including different window phases and idle decay.
 - Compare the independent specification and source-wise local HAProxy readings
   at controlled times. Use timestamped requests to quantify estimation error,
   not to assert equality to an exact sliding-window log.
+- Carried in from phase 08: read source entries through
+  `snapshot.Store.KeyView`, which returns the roster and the key's entries
+  under one lock, and sum only sources the roster reports Ready, as
+  `aggregate.Count` does. A rate built from a syncing, degraded, or
+  disconnected source must not be presented as complete.
 
 ## Acceptance
 

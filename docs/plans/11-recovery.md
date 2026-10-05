@@ -29,6 +29,11 @@ replay as new traffic or claiming completeness before every source is restored.
   their local expiry, and count against `max_source_entries` meanwhile; a
   source near the cap that reconnects with a changed key set is refused
   mid-teach and stays degraded until they expire. Reconcile them here.
+- Carried in from phase 08: held-over prior-session entries are counted
+  and flagged `aggregate.Contribution.HeldOver` (total `Uncertain`) until
+  reconciled here. A key that expired or was evicted at the source and was
+  recreated at a count at or above the stored one is indistinguishable from
+  continuous counting and is not flagged.
 
 ## Acceptance
 
