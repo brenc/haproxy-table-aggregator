@@ -2,6 +2,7 @@ package snapshot_test
 
 import (
 	"errors"
+	"math"
 	"net/netip"
 	"strings"
 	"testing"
@@ -576,5 +577,55 @@ func TestNewValidates(t *testing.T) {
 	}
 	if _, err := snapshot.New(good); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestDecreaseRecorded: an update that lowers a stored count replaces it
+// and is recorded on the entry, across sessions, until the entry ends;
+// an expired entry that was not yet purged passes no history on.
+func TestDecreaseRecorded(t *testing.T) {
+	h := newHarness(t, 16, "a")
+	k := key(t, "2001:db8::")
+	h.sync("a", 1)
+	h.must("a", 1, h.upd(1, k, math.MaxUint32))
+	h.must("a", 1, h.upd(2, k, 0))
+	e, _ := h.s.Lookup("a", inTable, k)
+	want := snapshot.Decrease{From: math.MaxUint32, To: 0, FromSession: 1, ToSession: 1, At: h.clock.Now()}
+	if e.Count != 0 || e.Decreases != 1 || e.LastDecrease != want {
+		t.Fatalf("after a wrap: %+v", e)
+	}
+	h.must("a", 1, h.upd(3, k, 7))
+	h.up("a", 2)
+	h.define("a", 2, inDef)
+	h.must("a", 2, h.timed(1, k, 7, 20000))
+	h.must("a", 2, h.timed(2, k, 4, 20000))
+	e, _ = h.s.Lookup("a", inTable, k)
+	if e.Count != 4 || e.Decreases != 2 || e.LastDecrease.From != 7 || e.LastDecrease.FromSession != 2 ||
+		e.LastDecrease.ToSession != 2 {
+		t.Fatalf("after a later decrease: %+v", e)
+	}
+	if r := h.state("a"); r.Decreases != 2 {
+		t.Fatalf("source decreases %d, want 2", r.Decreases)
+	}
+	// A lower count arriving with no lifetime left removes the entry; it
+	// is an expiry, not a stored decrease.
+	other := key(t, "2001:db8:1::")
+	h.must("a", 2, h.timed(3, other, 10, 20000))
+	h.must("a", 2, h.timed(4, other, 3, 0))
+	if _, ok := h.s.Lookup("a", inTable, other); ok {
+		t.Fatal("expired lower update stored")
+	}
+	if r := h.state("a"); r.Decreases != 2 || r.Expired != 1 {
+		t.Fatalf("after an expired lower update: decreases %d expired %d, want 2 and 1", r.Decreases, r.Expired)
+	}
+	// The entry expires; no read purges it before the next update.
+	h.clock.Advance(time.Duration(20000) * time.Millisecond)
+	h.must("a", 2, h.upd(3, k, 1))
+	e, _ = h.s.Lookup("a", inTable, k)
+	if e.Count != 1 || e.Decreases != 0 {
+		t.Fatalf("new entry after expiry: %+v", e)
+	}
+	if r := h.state("a"); r.Expired != 2 || r.Entries != 1 {
+		t.Fatalf("source after expiry: expired %d entries %d", r.Expired, r.Entries)
 	}
 }

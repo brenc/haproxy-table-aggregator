@@ -35,7 +35,7 @@ type source struct {
 	tables   map[string]*table
 	entries  int
 
-	accepted, refused, stale, expired uint64
+	accepted, refused, stale, expired, decreases uint64
 }
 
 // table is one logical input table of one source.
@@ -187,12 +187,30 @@ func (s *Store) update(src *source, ev peersession.EntryUpdated) error {
 		return refuse(ErrSchema, "source %s table %s key %v: %v", src.name, ev.Table, u.Key, err)
 	}
 	e.Session = src.session
+	now := s.now()
 	old, had := t.entries[u.Key]
+	if had && !old.Deadline.After(now) {
+		// Expired but not yet purged: it is already invisible, and its
+		// value and history must not carry into a new entry.
+		delete(t.entries, u.Key)
+		src.entries--
+		src.expired++
+		had = false
+	}
 	if had && u.Received.Before(old.Received) {
 		src.stale++
 		return nil
 	}
-	now := s.now()
+	lowered := had && e.Count < old.Count
+	if had {
+		e.Decreases, e.LastDecrease = old.Decreases, old.LastDecrease
+		if lowered {
+			e.Decreases++
+			e.LastDecrease = Decrease{
+				From: old.Count, To: e.Count, FromSession: old.Session, ToSession: e.Session, At: e.Received,
+			}
+		}
+	}
 	if !e.Deadline.After(now) {
 		if had {
 			delete(t.entries, u.Key)
@@ -212,6 +230,9 @@ func (s *Store) update(src *source, ev peersession.EntryUpdated) error {
 	}
 	t.entries[u.Key] = e
 	src.accepted++
+	if lowered {
+		src.decreases++
+	}
 	return nil
 }
 
@@ -352,7 +373,9 @@ func (s *Store) Lookup(sourceName, tableName string, key peermsg.Key) (Entry, bo
 }
 
 // Contributions returns every source's unexpired entry for the table and
-// key, in roster order: one per source at most, never combined.
+// key, in roster order: one per source at most, never combined. It does
+// not consider source state; use KeyView to read entries with the roster
+// state that certifies them.
 func (s *Store) Contributions(tableName string, key peermsg.Key) []Contribution {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -389,7 +412,42 @@ func (s *Store) Source(name string) (SourceReport, bool) {
 func (s *Store) Roster() Roster {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.roster(s.now())
+}
+
+// KeyView reports the roster and every source's unexpired entry for the
+// table and key, in roster order, at one moment under one lock, so that
+// a reader can tell which contributions the roster's state certifies.
+// Contributions alone, like Lookup, does not consider source state. ok
+// is false if tableName is not a configured input table.
+func (s *Store) KeyView(tableName string, key peermsg.Key) (r Roster, contributions []Contribution, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.isTable(tableName) {
+		return Roster{}, nil, false
+	}
 	now := s.now()
+	r = s.roster(now)
+	for _, name := range s.order {
+		if e, found := s.sources[name].tables[tableName].entries[key]; found && e.Deadline.After(now) {
+			contributions = append(contributions, Contribution{Source: name, Entry: e})
+		}
+	}
+	return r, contributions, true
+}
+
+func (s *Store) isTable(name string) bool {
+	for _, t := range s.tables {
+		if t.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// roster reports every source at now, after removing expired entries.
+// Callers hold s.mu.
+func (s *Store) roster(now time.Time) Roster {
 	r := Roster{At: now, Ready: true}
 	for _, name := range s.order {
 		src := s.sources[name]
@@ -409,6 +467,7 @@ func (s *Store) report(src *source, now time.Time) SourceReport {
 		Name: src.name, Session: src.session, Up: src.up, Synced: src.synced, PartialReplies: src.partials,
 		Fault: src.fault, Entries: src.entries,
 		Accepted: src.accepted, Refused: src.refused, Stale: src.stale, Expired: src.expired,
+		Decreases: src.decreases,
 	}
 	if src.up {
 		rep.LastRx = src.lastRx
