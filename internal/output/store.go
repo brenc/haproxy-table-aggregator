@@ -86,7 +86,7 @@ type StoreOptions struct {
 // Store holds at most one entry per table and key, so its size, and every
 // refresh, are bounded by the keys published and not yet retired; when to
 // retire is the publisher's policy (package publish retires zero-rate
-// keys in batches, and overflowing ones at once), and the bounds are
+// keys in batches, and keys it cannot evaluate at once), and the bounds are
 // phase 14's.
 type Store struct {
 	defs  []peermsg.Definition

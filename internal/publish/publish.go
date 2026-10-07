@@ -11,18 +11,19 @@
 // A key is reevaluated when a source's update for it is applied (Apply),
 // when its published rate is due to change without input
 // (aggregate.Cadence.Due: decay and expiry), and after any change of
-// source state (every key then). Only a value that
-// aggregate.RateTotal.Authoritative certifies is written: one evaluated
-// while every configured source was Ready, that fits the 32-bit rate slot.
+// source state (every key then). Only a value evaluated while every
+// configured source was Ready is written (aggregate.RateTotal.Authoritative),
+// saturated to the 32-bit rate slot as described below.
 // The output store keeps only the latest value per key, so superseded
 // values are coalesced before any session sends them, and a value that is
 // unchanged is not sent again.
 //
-// A rate that does not fit the slot (aggregate.ErrOverflow) is withheld:
-// the key is retired from the output, so HAProxy's copy keeps an older
-// session generation that no later marker certifies, and the key reads as
-// local protection until its rate fits again. A value is never saturated
-// to fit.
+// A complete rate that does not fit the slot (aggregate.ErrOverflow) is
+// published as math.MaxUint32, a lower bound on the true sum. The slot
+// only feeds limit checks, and any limit below math.MaxUint32 decides
+// the same for the bound as for the true sum, so every proxy keeps
+// denying the key; reading the slot as an exact count would be wrong.
+// The key is published exactly again once its rate fits.
 //
 // A missing aggregate entry is never read as a zero rate: under the
 // frozen authority rule a missing key selects local protection, which
@@ -63,6 +64,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -127,7 +129,7 @@ type Options struct {
 	// Coalesce is the shortest time between passes that input triggers:
 	// zero means DefaultCoalesce.
 	Coalesce time.Duration
-	// Logger receives authority transitions and withheld values; nil
+	// Logger receives authority transitions and saturated values; nil
 	// discards them.
 	Logger *slog.Logger
 }
@@ -154,9 +156,10 @@ type Stats struct {
 	// Published is the number of keys currently in the output, and
 	// Uncertain how many of them were Uncertain when last evaluated.
 	Published, Uncertain int
-	// Withheld is the number of keys whose rate does not fit the output
-	// slot and is withheld; Overflows counts withholdings.
-	Withheld  int
+	// Saturated is the number of keys whose rate does not fit the output
+	// slot and is published as math.MaxUint32; Overflows counts how often
+	// a key started saturating.
+	Saturated int
 	Overflows uint64
 	// Retired counts keys retired from the output.
 	Retired uint64
@@ -170,7 +173,7 @@ type Stats struct {
 type keyState struct {
 	value     uint32
 	published bool // value is in the output store
-	withheld  bool // the rate overflowed the slot
+	saturated bool // the rate overflowed the slot
 	uncertain bool
 	due       time.Time // next evaluation without input; zero if none
 }
@@ -445,17 +448,20 @@ func (p *Publisher) evaluate(i int, k peermsg.Key) bool {
 		st.due = d
 	}
 	v, err := rt.Authoritative()
+	saturated := false
 	switch {
 	case errors.Is(err, aggregate.ErrIncomplete):
 		return false
-	case err != nil:
-		if !st.withheld {
+	case errors.Is(err, aggregate.ErrOverflow):
+		v, saturated = math.MaxUint32, true
+		if !st.saturated {
 			p.update(func(s *Stats) { s.Overflows++ })
-			p.log.Warn("aggregate rate withheld: it does not fit the output slot", "table", r.Input,
-				"key", k, "rate", rt.Sum, "err", err)
+			p.log.Warn("aggregate rate saturated: it does not fit the output slot", "table", r.Input,
+				"key", k, "rate", rt.Sum, "published", v)
 		}
+	case err != nil:
 		p.withdraw(r, k, st)
-		st.withheld = true
+		p.update(func(s *Stats) { s.Errors++; s.LastError = err.Error() })
 		return true
 	}
 	if serr := p.out.Set(r.Output, k, output.AggregateValues(v)); serr != nil {
@@ -464,7 +470,7 @@ func (p *Publisher) evaluate(i int, k peermsg.Key) bool {
 		p.update(func(s *Stats) { s.Errors++; s.LastError = serr.Error() })
 		return true
 	}
-	st.value, st.published, st.withheld, st.uncertain = v, true, false, rt.Uncertain
+	st.value, st.published, st.saturated, st.uncertain = v, true, saturated, rt.Uncertain
 	return true
 }
 
@@ -486,7 +492,7 @@ func (p *Publisher) retireIdle() {
 	batch := map[string][]peermsg.Key{}
 	for i, r := range p.routes {
 		for k, st := range p.keys[i] {
-			if !st.due.IsZero() || st.withheld {
+			if !st.due.IsZero() {
 				continue
 			}
 			if st.published && st.value != 0 {
@@ -564,7 +570,7 @@ func (p *Publisher) notReady(why string) {
 }
 
 func (p *Publisher) publishStats() {
-	published, uncertain, withheld := 0, 0, 0
+	published, uncertain, saturated := 0, 0, 0
 	for i := range p.routes {
 		for _, st := range p.keys[i] {
 			if st.published {
@@ -573,12 +579,12 @@ func (p *Publisher) publishStats() {
 					uncertain++
 				}
 			}
-			if st.withheld {
-				withheld++
+			if st.published && st.saturated {
+				saturated++
 			}
 		}
 	}
-	p.update(func(s *Stats) { s.Published, s.Uncertain, s.Withheld = published, uncertain, withheld })
+	p.update(func(s *Stats) { s.Published, s.Uncertain, s.Saturated = published, uncertain, saturated })
 }
 
 // signature identifies every source's state and session, so a pass can

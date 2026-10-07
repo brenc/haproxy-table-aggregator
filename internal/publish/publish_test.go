@@ -305,10 +305,10 @@ func TestRetireIdle(t *testing.T) {
 	}
 }
 
-// TestOverflowWithheld checks that a rate beyond the 32-bit slot is never
-// published, saturated or wrapped: the key is retired and counted, and
-// published again once it fits.
-func TestOverflowWithheld(t *testing.T) {
+// TestOverflowSaturated checks that a complete rate beyond the 32-bit
+// slot is published as math.MaxUint32, never wrapped or withdrawn, is
+// counted once, and is published exactly again once it fits.
+func TestOverflowSaturated(t *testing.T) {
 	h := newHarness(t, publish.Options{})
 	k := key(t, "2001:db8:1::")
 	h.sync("a")
@@ -321,18 +321,23 @@ func TestOverflowWithheld(t *testing.T) {
 	h.counter("a", k, math.MaxUint32, 0)
 	h.counter("b", k, 1, 0)
 	h.pub.Pass()
-	if v, ok := h.published(k); ok {
-		t.Fatalf("overflowing rate published as %d", v)
+	if v, ok := h.published(k); !ok || v != math.MaxUint32 {
+		t.Fatalf("overflowing rate: %d %v, want saturated", v, ok)
 	}
-	if st := h.pub.Stats(); st.Overflows != 1 || st.Withheld != 1 || st.Retired != 1 || !st.Leased {
+	if st := h.pub.Stats(); st.Overflows != 1 || st.Saturated != 1 || st.Retired != 0 || !st.Leased {
 		t.Fatalf("stats %+v", st)
+	}
+	h.counter("b", k, 2, 0)
+	h.pub.Pass()
+	if st := h.pub.Stats(); st.Overflows != 1 || st.Saturated != 1 {
+		t.Fatalf("still saturated: stats %+v", st)
 	}
 	h.counter("b", k, 0, 0)
 	h.pub.Pass()
 	if v, ok := h.published(k); !ok || v != math.MaxUint32 {
 		t.Fatalf("fitting rate: %d %v", v, ok)
 	}
-	if st := h.pub.Stats(); st.Withheld != 0 || st.Overflows != 1 {
+	if st := h.pub.Stats(); st.Saturated != 0 || st.Overflows != 1 {
 		t.Fatalf("stats %+v", st)
 	}
 }

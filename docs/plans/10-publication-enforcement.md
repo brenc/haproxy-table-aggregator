@@ -198,11 +198,18 @@ quota. Keep the configurations alongside the implementation and cite them here.
     incomplete mid-pass, writes no value and revokes once; the next ready
     pass reevaluates every key before leasing again. Passes triggered by
     input are coalesced (at most one per 5 ms).
-  - Overflow (phase 09 handoff): a rate above 2^32-1 is withheld: the key
-    is retired at once (its HAProxy copy keeps an old generation, so it
-    reads local) and counted (`Stats.Overflows`, `Withheld`); it is
-    published again when it fits. `output.RateValue` (saturation) is
-    removed; nothing saturates a certified value.
+  - Overflow (phase 09 handoff; owner decision 2026-10-07): a complete
+    rate above 2^32-1 is published as 2^32-1 under the lease and counted
+    (`Stats.Overflows`, `Saturated`); it is published exactly again once
+    it fits. This deliberately overrides the phase 09 handoff's "never
+    use a saturated value to certify authority": the slot only feeds
+    limit checks, and any limit below 2^32-1 decides the same for the
+    bound as for the true sum, so every proxy keeps denying the key
+    (fail closed). Withholding the key instead, as first implemented,
+    would make every other proxy read it as local and admit it below its
+    own local limit. The cost is that the slot is a lower bound, not a
+    count, while saturated. `output.RateValue` stays removed; package
+    publish owns the narrowing. Covered by `TestOverflowSaturated`.
   - Missing versus incomplete: a missing key reads local, which decides
     exactly as a zero aggregate would (the aggregate can only add
     denials), so no missing key is ever interpreted as zero; incomplete

@@ -211,8 +211,11 @@ func (r RateTotal) Uint32() (uint32, error) {
 // as one: ErrIncomplete unless every configured source was Ready, or
 // ErrOverflow if Sum does not fit the slot. Uncertain is not an error; it
 // is reported for diagnostics. A caller that gets an error must not
-// certify the value (publish it under a valid lease); falling back to
-// local protection is the safe outcome.
+// certify the returned value (publish it under a valid lease). After
+// ErrOverflow the sum is still complete, so a caller may certify
+// math.MaxUint32 as a lower bound in its place (package publish does);
+// after ErrIncomplete, falling back to local protection is the safe
+// outcome.
 func (r RateTotal) Authoritative() (uint32, error) {
 	if !r.Complete {
 		return 0, fmt.Errorf("%w: table %s key %v at %v", ErrIncomplete, r.Table, r.Key, r.At)

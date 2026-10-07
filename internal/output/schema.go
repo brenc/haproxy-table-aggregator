@@ -26,8 +26,9 @@
 //	slot 0  SchemaVersion (2)
 //	slot 1  aggregate rate, in estimated requests per configured period
 //	        of the input's http_req_rate (not per second), 0 to
-//	        math.MaxUint32; a larger rate is never written, and its key
-//	        reads as local protection (package publish)
+//	        math.MaxUint32; a larger rate is written as math.MaxUint32,
+//	        a lower bound that still exceeds any smaller limit (package
+//	        publish)
 //	slot 2  generation of the peers session that wrote it, never 0
 //	slot 3  reserved, always 0
 //
@@ -204,9 +205,8 @@ func Definition(name string, expiry peermsg.Millis) peermsg.Definition {
 
 // AggregateValues returns an aggregate entry carrying rate. Its
 // generation slot is 0; each session fills in its own when it writes the
-// entry. A rate that does not fit 32 bits has no entry at all: it is
-// never saturated or wrapped (see aggregate.RateTotal.Authoritative and
-// package publish).
+// entry. Narrowing a larger rate is the caller's policy: package publish
+// writes math.MaxUint32 for a rate that does not fit, and never wraps.
 func AggregateValues(rate uint32) Values {
 	return Values{SlotVersion: SchemaVersion, SlotRate: rate}
 }
