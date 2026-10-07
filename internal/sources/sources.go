@@ -59,8 +59,10 @@
 // table once the source has announced a matching definition of it, the
 // whole store whenever the source requests a resync, then each change as
 // Publish makes it, and the lease (SetLease, Revoke) after the values it
-// certifies. Sessions read the store independently, so a slow source
-// delays only its own session. Output is never an input: the sources'
+// certifies. Sessions read the store independently and send through their
+// own bounded queues (see package peersession), so a slow source delays
+// only its own session's output, and never its own input or another
+// source's session. Output is never an input: the sources'
 // copies of output tables are acknowledged but never queued as events,
 // and no session ever announces an input table.
 package sources

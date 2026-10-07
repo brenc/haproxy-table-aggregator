@@ -2,7 +2,7 @@
 // on SIGINT/SIGTERM or, with -smoke, after a scripted traffic check.
 //
 //	htalab -haproxy /path/to/haproxy [-period 10s] [-smoke] [-record-dir DIR]
-//	       [-aggregator NAME@ADDR [-htad-config FILE]]
+//	       [-aggregator NAME@ADDR [-htad-config FILE] [-limit N]]
 //
 // -haproxy defaults to $HTA_HAPROXY. The lab runs two independent stock
 // HAProxy processes on loopback; see internal/lab. With -aggregator, each
@@ -10,7 +10,9 @@
 // which the nodes dial at ADDR (a loopback ip:port), and -htad-config
 // writes a matching htad configuration that listens on ADDR for the
 // sessions both nodes open and also dials node b, so both connection
-// directions (and their collisions) occur.
+// directions (and their collisions) occur. -limit N makes each node's lab
+// listener enforce N requests per period, locally always and on the
+// aggregate output while it is authoritative (see internal/lab).
 package main
 
 import (
@@ -44,6 +46,7 @@ func run(args []string, out io.Writer) (err error) {
 	recordDir := fs.String("record-dir", "", "write the run record JSON to this directory")
 	aggFlag := fs.String("aggregator", "", "aggregator peer as NAME@ip:port; adds a peers section to each node")
 	htadConfig := fs.String("htad-config", "", "with -aggregator, write an htad configuration for this lab here")
+	limit := fs.Int("limit", 0, "with -aggregator, enforce this many requests per period on the lab listener")
 	if err = fs.Parse(args); err != nil {
 		return err
 	}
@@ -56,9 +59,9 @@ func run(args []string, out io.Writer) (err error) {
 		if !ok {
 			return fmt.Errorf("-aggregator %q: want NAME@ip:port", *aggFlag)
 		}
-		agg = &lab.Aggregator{Name: name, Addr: addr}
-	} else if *htadConfig != "" {
-		return errors.New("-htad-config needs -aggregator")
+		agg = &lab.Aggregator{Name: name, Addr: addr, Limit: *limit}
+	} else if *htadConfig != "" || *limit != 0 {
+		return errors.New("-htad-config and -limit need -aggregator")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -125,7 +128,7 @@ func writeHtadConfig(path string, l *lab.Lab, agg *lab.Aggregator) error {
 		},
 		"tables": []map[string]string{{"name": lab.LabTable, "period": l.Period.String()}},
 		"outputs": []map[string]string{
-			{"name": lab.OutputTable, "kind": "aggregate", "expire": expire},
+			{"name": lab.OutputTable, "kind": "aggregate", "input": lab.LabTable, "expire": expire},
 			{"name": lab.MetaTable, "kind": "metadata", "expire": lab.MetaExpire.String()},
 		},
 	}

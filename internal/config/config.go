@@ -20,7 +20,7 @@
 //	  ],
 //	  "tables": [{"name": "lab_in", "period": "10s"}],
 //	  "outputs": [
-//	    {"name": "lab_out", "kind": "aggregate", "expire": "30s"},
+//	    {"name": "lab_out", "kind": "aggregate", "input": "lab_in", "expire": "30s"},
 //	    {"name": "lab_meta", "kind": "metadata", "expire": "2s"}
 //	  ]
 //	}
@@ -28,7 +28,10 @@
 // Output tables are optional; their layout is fixed by package output.
 // Each must match the source's own stick table of that name (gpt(4) and
 // the same expire), no output name may be an input table name, a
-// metadata table expires after at most output.MaxLease. request_resync
+// metadata table expires after at most output.MaxLease. An aggregate
+// output names the input table whose aggregate rate it publishes; each
+// input has at most one. Without a metadata table, which carries the
+// lease, HAProxy never treats an aggregate as authoritative. request_resync
 // may only be true (the default): a source becomes ready only after a
 // complete resync.
 package config
@@ -190,6 +193,9 @@ type Output struct {
 	// Expire is the source table's configured expire, whole
 	// milliseconds from 1ms to MaxExpire.
 	Expire time.Duration
+	// Input is, for an aggregate output, the configured input table
+	// whose aggregate rate it publishes; empty for a metadata table.
+	Input string
 }
 
 // MaxExpire is the largest output table expire: HAProxy stores table
@@ -270,6 +276,7 @@ type FileTable struct {
 type FileOutput struct {
 	Name   string    `json:"name"`
 	Kind   string    `json:"kind"`
+	Input  string    `json:"input"`
 	Expire *Duration `json:"expire"`
 }
 
@@ -465,9 +472,12 @@ func (c *Config) addOutputs(outputs []FileOutput) error {
 		return invalid("outputs: at most %d output tables, have %d", MaxTables, len(outputs))
 	}
 	seen := map[string]bool{}
+	inputs := map[string]bool{}
 	for _, t := range c.Tables {
 		seen[t.Name] = true
+		inputs[t.Name] = true
 	}
+	fed := map[string]bool{}
 	for i, o := range outputs {
 		if err := (peermsg.Definition{Name: o.Name, KeyType: peermsg.KeyTypeIPv6, Expiry: 1}).Validate(); err != nil {
 			return invalid("outputs[%d].name: %v", i, err)
@@ -492,7 +502,22 @@ func (c *Config) addOutputs(outputs []FileOutput) error {
 			return invalid("outputs[%d].expire: a metadata table holds the lease marker, so it expires after at "+
 				"most %v, not %v", i, output.MaxLease, e)
 		}
-		c.Outputs = append(c.Outputs, Output{Name: o.Name, Kind: kind, Expire: e})
+		switch kind {
+		case output.KindAggregate:
+			if !inputs[o.Input] {
+				return invalid("outputs[%d].input: %q is not a configured input table; an aggregate output "+
+					"publishes one input table's aggregate rate", i, o.Input)
+			}
+			if fed[o.Input] {
+				return invalid("outputs[%d].input: input table %q already has an aggregate output", i, o.Input)
+			}
+			fed[o.Input] = true
+		case output.KindMetadata:
+			if o.Input != "" {
+				return invalid("outputs[%d].input: a metadata table summarizes no input table", i)
+			}
+		}
+		c.Outputs = append(c.Outputs, Output{Name: o.Name, Kind: kind, Expire: e, Input: o.Input})
 	}
 	return nil
 }

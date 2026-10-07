@@ -30,7 +30,7 @@ func liveOutputConfig(t *testing.T, period time.Duration, srcs ...config.FileSou
 		Sources:                      srcs,
 		Tables:                       []config.FileTable{{Name: lab.LabTable, Period: d(period)}},
 		Outputs: []config.FileOutput{
-			{Name: lab.OutputTable, Kind: "aggregate", Expire: expire},
+			{Name: lab.OutputTable, Kind: "aggregate", Input: lab.LabTable, Expire: expire},
 			{Name: lab.MetaTable, Kind: "metadata", Expire: d(lab.MetaExpire)},
 		},
 		IdleTimeout:  d(config.MinIdleTimeout),
@@ -500,7 +500,7 @@ func TestLiveOutputNeedsMatchingTable(t *testing.T) {
 				InsecurePlaintextLoopbackLab: true,
 				Sources:                      []config.FileSource{{Name: "a", Address: a.PeersAddr}},
 				Tables:                       []config.FileTable{{Name: lab.LabTable, Period: d(l.Period)}},
-				Outputs:                      []config.FileOutput{{Name: tc.table, Kind: "aggregate", Expire: d(tc.expire)}},
+				Outputs:                      []config.FileOutput{{Name: tc.table, Kind: "aggregate", Input: lab.LabTable, Expire: d(tc.expire)}},
 				IdleTimeout:                  d(config.MinIdleTimeout),
 				ReconnectMin:                 d(50 * time.Millisecond),
 				ReconnectMax:                 d(200 * time.Millisecond),

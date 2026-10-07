@@ -1,0 +1,14 @@
+{
+  "local_peer": "agg",
+  "insecure_plaintext_loopback_lab": true,
+  "listen": "127.0.0.1:10000",
+  "sources": [
+    {"name": "a", "address": "127.0.0.1:10001"},
+    {"name": "b", "address": "127.0.0.1:10002"}
+  ],
+  "tables": [{"name": "req_in", "period": "10s"}],
+  "outputs": [
+    {"name": "req_agg", "kind": "aggregate", "input": "req_in", "expire": "30s"},
+    {"name": "req_meta", "kind": "metadata", "expire": "2s"}
+  ]
+}

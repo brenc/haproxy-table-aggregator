@@ -68,6 +68,21 @@
 // updates are acknowledged and counted (Stats.EchoedUpdates), but never
 // delivered to the sink, so output can never become an input.
 //
+// # Sending
+//
+// Once established, the session hands everything it sends to its own
+// writer goroutine through an ordered byte queue, so it keeps reading,
+// acknowledging, and answering a source whose reads are slow: that
+// source's input stays current and its heartbeats and resync controls are
+// handled. While more than SoftBacklog bytes wait, the session defers
+// output changes, refreshes, and markers; the output store keeps only the
+// latest value per key, so deferred changes coalesce and the queue grows
+// only by controls and acknowledgements. A deferred marker is simply
+// late, and a source that stops receiving markers falls back to local
+// protection when its last one runs out, while other sessions are
+// unaffected. Each write waits at most the idle timeout, and more than
+// HardBacklog bytes queued ends the session with ErrLimit.
+//
 // # Failure handling
 //
 // The session fails closed. Unknown message classes, unknown control or

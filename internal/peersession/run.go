@@ -46,6 +46,16 @@ func (c *Conn) Run(ctx context.Context, sink Sink) (err error) {
 		}
 	}()
 	defer c.watch(ctx)()
+	c.startWriter(ctx)
+	defer func() {
+		// Let a final error message out unless the session was
+		// cancelled.
+		drain := errorTimeout
+		if ctx.Err() != nil {
+			drain = 0
+		}
+		c.stopWriter(drain)
+	}()
 	now := time.Now()
 	c.lastRx, c.rxTime = now, now
 	if c.lastTx.IsZero() {
@@ -69,15 +79,22 @@ func (c *Conn) Run(ctx context.Context, sink Sink) (err error) {
 			}
 			return wrap(ErrClosed, "end of stream")
 		}
+		if err := c.wq.error(); err != nil {
+			return err
+		}
 		if err := c.flushAcks(ctx); err != nil {
 			return err
 		}
-		if err := c.refresh(ctx, time.Now()); err != nil {
-			return err
-		}
-		if c.outWake.Swap(false) {
-			if err := c.publish(ctx); err != nil {
+		blocked := c.deferOutput(c.backlogged())
+		if !blocked {
+			if err := c.refresh(ctx, time.Now()); err != nil {
 				return err
+			}
+			if c.outWake.Swap(false) || c.outPending {
+				c.outPending = false
+				if err := c.publish(ctx); err != nil {
+					return err
+				}
 			}
 		}
 		if err := c.tick(ctx, time.Now()); err != nil {
@@ -89,7 +106,7 @@ func (c *Conn) Run(ctx context.Context, sink Sink) (err error) {
 			}
 		}
 		next := minTime(c.lastRx.Add(c.opts.IdleTimeout), c.lastTx.Add(c.opts.Heartbeat))
-		if !c.refreshAt.IsZero() {
+		if !c.refreshAt.IsZero() && !blocked {
 			next = minTime(next, c.refreshAt)
 		}
 		if !c.resyncAt.IsZero() {

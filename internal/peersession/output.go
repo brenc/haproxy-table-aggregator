@@ -171,6 +171,10 @@ func (c *Conn) leaseAfterTeach() {
 	c.outWake.Store(true)
 }
 
+// beforeLeaseHook, when set by a test, runs in publish after the values
+// are queued and before the lease marker is written.
+var beforeLeaseHook func(*Conn)
+
 // publish sends every entry changed since the last teach or publish,
 // switching tables with a definition as HAProxy does. Entries of tables
 // the source has not announced yet are skipped; teachTable sends them
@@ -179,6 +183,13 @@ func (c *Conn) publish(ctx context.Context) error {
 	// The lease is read before the values, so every value it certifies
 	// (up to lease.Seq) is among those written below or earlier.
 	lease := c.opts.Output.Lease()
+	if lease.Valid {
+		// A live marker of this lease may follow the values; report it
+		// as possibly outstanding from now on, until writeLease has
+		// counted it (or decided not to write it).
+		c.markerPending.Store(true)
+		defer c.markerPending.Store(false)
+	}
 	if r := c.opts.Output.Retired(); r != c.retiredSeen {
 		c.retiredSeen = r
 		if err := c.rotate(ctx); err != nil {
@@ -207,6 +218,9 @@ func (c *Conn) publish(ctx context.Context) error {
 		return err
 	}
 	c.outSeq = seq
+	if beforeLeaseHook != nil {
+		beforeLeaseHook(c)
+	}
 	return c.writeLease(ctx, lease)
 }
 
@@ -235,6 +249,11 @@ func (c *Conn) writeLease(ctx context.Context, l output.Lease) error {
 		if t.kind != output.KindMetadata {
 			continue
 		}
+		if l.Valid && n == 0 {
+			// Counted before the marker is queued, so that from now on
+			// Stats.LiveMarker reports it may be outstanding.
+			c.liveGen.Add(1)
+		}
 		if c.outSel != t.id {
 			if err := c.appendDefinition(t); err != nil {
 				return err
@@ -253,6 +272,7 @@ func (c *Conn) writeLease(ctx context.Context, l output.Lease) error {
 		c.markers.Add(1)
 		if !l.Valid {
 			c.revocations.Add(1)
+			c.noteRevocation()
 		}
 		c.markerDL.Store(values[output.SlotDeadline])
 		c.markerNano.Store(time.Now().UnixNano())

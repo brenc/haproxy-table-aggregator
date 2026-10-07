@@ -85,15 +85,16 @@ type StoreOptions struct {
 // while a generation change makes that copy non-authoritative at once. A
 // Store holds at most one entry per table and key, so its size, and every
 // refresh, are bounded by the keys published and not yet retired; when to
-// retire is the publisher's policy (phase 10), and the bounds are phase
-// 14's.
+// retire is the publisher's policy (package publish retires zero-rate
+// keys in batches, and overflowing ones at once), and the bounds are
+// phase 14's.
 type Store struct {
 	defs  []peermsg.Definition
 	kinds map[string]Kind
 	index map[string]int
 	wall  func() time.Time
 
-	// retired counts Retire calls that removed a key.
+	// retired counts the keys Retire and RetireBatch removed.
 	retired uint64
 
 	mu      sync.Mutex
@@ -204,20 +205,39 @@ func (s *Store) Set(table string, key peermsg.Key, values Values) error {
 // value change has. Each Retire that removes a key costs every session a
 // full re-send (retirements seen at one wake-up share it), and every
 // remaining key reads as local from its re-send until the new marker
-// arrives, so a publisher should retire keys in batches (phase 10). It
+// arrives, so a publisher should retire keys together (RetireBatch). It
 // fails, wrapping ErrInvalid, for an unknown or metadata table.
 func (s *Store) Retire(table string, key peermsg.Key) error {
-	i, ok := s.index[table]
-	if !ok || s.kinds[table] != KindAggregate {
-		return fmt.Errorf("%w: %q is not an aggregate output table", ErrInvalid, table)
+	return s.RetireBatch(map[string][]peermsg.Key{table: {key}})
+}
+
+// RetireBatch retires every listed key of every listed aggregate table at
+// once, as Retire does for one: the removals are one change, so each
+// session rotates its generation and re-sends the remaining output once
+// for the whole batch. It fails, wrapping ErrInvalid, before removing
+// anything if any table is unknown or a metadata table.
+func (s *Store) RetireBatch(keys map[string][]peermsg.Key) error {
+	for table := range keys {
+		if _, ok := s.index[table]; !ok || s.kinds[table] != KindAggregate {
+			return fmt.Errorf("%w: %q is not an aggregate output table", ErrInvalid, table)
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.entries[i][key]; !ok {
+	removed := 0
+	for table, ks := range keys {
+		i := s.index[table]
+		for _, key := range ks {
+			if _, ok := s.entries[i][key]; ok {
+				delete(s.entries[i], key)
+				removed++
+			}
+		}
+	}
+	if removed == 0 {
 		return nil
 	}
-	delete(s.entries[i], key)
-	s.retired++
+	s.retired += uint64(removed)
 	s.notify()
 	return nil
 }

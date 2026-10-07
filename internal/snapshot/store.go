@@ -436,6 +436,30 @@ func (s *Store) KeyView(tableName string, key peermsg.Key) (r Roster, contributi
 	return r, contributions, true
 }
 
+// Keys returns every key for which any source, whatever its state, holds
+// an unexpired entry in the table, each once, in no particular order. A
+// publisher evaluates these keys; whether a source's entry counts is
+// decided when the key is read (KeyView).
+func (s *Store) Keys(tableName string) []peermsg.Key {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.isTable(tableName) {
+		return nil
+	}
+	now := s.now()
+	seen := map[peermsg.Key]bool{}
+	var out []peermsg.Key
+	for _, name := range s.order {
+		for k, e := range s.sources[name].tables[tableName].entries {
+			if !seen[k] && e.Deadline.After(now) {
+				seen[k] = true
+				out = append(out, k)
+			}
+		}
+	}
+	return out
+}
+
 // Table returns the configured input table named name. The configuration
 // is fixed at New, so no lock is needed.
 func (s *Store) Table(name string) (Table, bool) {

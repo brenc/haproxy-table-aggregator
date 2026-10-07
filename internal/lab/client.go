@@ -34,6 +34,13 @@ type Response struct {
 	// Lookup is the http_req_cnt HAProxy looked up for Key after tracking,
 	// or -1 when the response carried no value.
 	Lookup int64
+	// The enforcing lab listener's decision (Aggregator.Limit): Authority
+	// is "aggregate" or "local", Deny the limit that answered 429
+	// ("local" or "aggregate", empty if none), LocalRate the node's
+	// http_req_rate including this request, and AggRate the aggregate
+	// output's rate slot. Empty and -1 without enforcement.
+	Authority, Deny    string
+	LocalRate, AggRate int64
 }
 
 // NewClient returns a Client whose connections originate from source, or
@@ -104,7 +111,7 @@ func newClient(dial func(context.Context, string, string) (net.Conn, error)) (*C
 // consult the Responder rather than assume either outcome.
 func (c *Client) Send(ctx context.Context, addr, clientIP string) (Response, error) {
 	id := c.prefix + "-" + strconv.FormatUint(c.seq.Add(1), 10)
-	resp := Response{ID: id, Lookup: -1}
+	resp := Response{ID: id, Lookup: -1, LocalRate: -1, AggRate: -1}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/", http.NoBody)
 	if err != nil {
 		return resp, fmt.Errorf("request %s: %w", id, err)
@@ -123,12 +130,20 @@ func (c *Client) Send(ctx context.Context, addr, clientIP string) (Response, err
 	}
 	resp.Status = res.StatusCode
 	resp.Key = res.Header.Get(KeyHeader)
-	if v := res.Header.Get(LookupHeader); v != "" {
+	resp.Authority, resp.Deny = res.Header.Get(AuthorityHeader), res.Header.Get(DenyHeader)
+	for _, f := range []struct {
+		hdr string
+		dst *int64
+	}{{LookupHeader, &resp.Lookup}, {LocalRateHeader, &resp.LocalRate}, {AggRateHeader, &resp.AggRate}} {
+		v := res.Header.Get(f.hdr)
+		if v == "" {
+			continue
+		}
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
-			return resp, fmt.Errorf("request %s: bad %s %q: %w", id, LookupHeader, v, err)
+			return resp, fmt.Errorf("request %s: bad %s %q: %w", id, f.hdr, v, err)
 		}
-		resp.Lookup = n
+		*f.dst = n
 	}
 	return resp, nil
 }

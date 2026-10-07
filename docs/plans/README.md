@@ -12,7 +12,7 @@
 - [x] [07 — Source snapshots](07-source-snapshots.md)
 - [x] [08 — Counter aggregation](08-counter-aggregation.md)
 - [x] [09 — Rate evaluation](09-rate-evaluation.md)
-- [ ] [10 — Publication and enforcement](10-publication-enforcement.md)
+- [x] [10 — Publication and enforcement](10-publication-enforcement.md)
 - [ ] [11 — Restart and reconnect recovery](11-recovery.md)
 - [ ] [12 — Reload continuity gate](12-reload-continuity.md)
 - [ ] [13 — Mutual TLS and peer authorization](13-peer-security.md)

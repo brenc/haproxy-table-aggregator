@@ -2,6 +2,7 @@ package output_test
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"net/netip"
 	"slices"
@@ -59,14 +60,6 @@ func TestSchema(t *testing.T) {
 	}
 	if v := output.RevocationValues(); v != (output.Values{2, 0, 0, 0}) {
 		t.Fatalf("revocation values %v", v)
-	}
-	for in, want := range map[uint64]uint32{
-		0: 0, 1: 1, math.MaxUint32 - 1: math.MaxUint32 - 1, math.MaxUint32: math.MaxUint32,
-		math.MaxUint32 + 1: math.MaxUint32, math.MaxUint64: math.MaxUint32,
-	} {
-		if got := output.RateValue(in); got != want {
-			t.Errorf("RateValue(%d) = %d, want %d", in, got, want)
-		}
 	}
 	if output.MetadataKey.String() != "::" {
 		t.Fatalf("metadata key %v", output.MetadataKey)
@@ -368,5 +361,52 @@ func TestRetire(t *testing.T) {
 	}
 	if output.MaxLeaseLength != time.Second {
 		t.Fatalf("lease limit %v", output.MaxLeaseLength)
+	}
+}
+
+// TestRetireBatch checks that a batch removes every listed key as one
+// change: the change channel closes once, and nothing is removed if any
+// table is invalid.
+func TestRetireBatch(t *testing.T) {
+	s := newStore(t, output.StoreOptions{})
+	var ks []peermsg.Key
+	for i := 1; i <= 5; i++ {
+		k := key(t, fmt.Sprintf("2001:db8:%d::", i))
+		ks = append(ks, k)
+		if err := s.Set("out", k, output.AggregateValues(5)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.RetireBatch(map[string][]peermsg.Key{"out": ks[:2], "meta": ks[2:]}); !errors.Is(err, output.ErrInvalid) {
+		t.Fatalf("batch with a metadata table: %v", err)
+	}
+	if all, _ := s.Since(0); len(all) != 5 || s.Retired() != 0 {
+		t.Fatalf("invalid batch removed keys: %d left, retired %d", len(all), s.Retired())
+	}
+	ch := s.Changed()
+	if err := s.RetireBatch(map[string][]peermsg.Key{"out": ks[:4]}); err != nil {
+		t.Fatal(err)
+	}
+	after := s.Changed()
+	select {
+	case <-ch:
+	default:
+		t.Fatal("RetireBatch did not wake sessions")
+	}
+	select {
+	case <-after:
+		t.Fatal("RetireBatch notified more than once")
+	default:
+	}
+	if all, _ := s.Since(0); len(all) != 1 || all[0].Key != ks[4] || s.Retired() != 4 {
+		t.Fatalf("after RetireBatch: %v, retired %d", all, s.Retired())
+	}
+	if err := s.RetireBatch(map[string][]peermsg.Key{"out": ks[:4]}); err != nil || s.Retired() != 4 {
+		t.Fatalf("retiring absent keys: %v, retired %d", err, s.Retired())
+	}
+	select {
+	case <-after:
+		t.Fatal("retiring absent keys woke sessions")
+	default:
 	}
 }

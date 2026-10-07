@@ -91,6 +91,12 @@ type Aggregator struct {
 	// tables in configuration order, so those nodes announce different
 	// table IDs than the others.
 	OutputFirst []string
+	// Limit, when positive, makes every node's lab listener enforce it
+	// as the full per-proxy threshold of requests per period: locally
+	// on the node's own http_req_rate always, and on the aggregate
+	// output's rate while it is authoritative (see output package
+	// documentation). Either can answer 429. Zero enforces nothing.
+	Limit int
 }
 
 func (a *Aggregator) addr(node string) string {
@@ -250,6 +256,9 @@ func validateAggregator(agg *Aggregator, nodes []string) error {
 	if slices.Contains(nodes, agg.Name) {
 		return fmt.Errorf("lab: aggregator peer name %q is also a node name", agg.Name)
 	}
+	if agg.Limit < 0 {
+		return fmt.Errorf("lab: aggregator limit %d is negative", agg.Limit)
+	}
 	for _, name := range agg.OutputFirst {
 		if !slices.Contains(nodes, name) {
 			return fmt.Errorf("lab: aggregator OutputFirst names %q, which is not a node", name)
@@ -373,7 +382,7 @@ func (l *Lab) startNode(ctx context.Context, haproxy, name string, agg *Aggregat
 	}
 	n.LabAddr, n.ProdAddr4, n.ProdAddr6, n.ProxyAddr = labAddr, prod4, prod6, proxyAddr
 	var aggName, aggAddr, peersBind, probeBind string
-	outputFirst := false
+	outputFirst, limit := false, 0
 	if agg != nil && reloadable {
 		n.PeersPath = filepath.Join(l.Dir, name+".peers")
 		peersBind = n.PeersPath
@@ -388,37 +397,43 @@ func (l *Lab) startNode(ctx context.Context, haproxy, name string, agg *Aggregat
 		}
 		aggName, aggAddr = agg.Name, agg.addr(name)
 		outputFirst = slices.Contains(agg.OutputFirst, name)
+		limit = agg.Limit
 	}
 
 	cfg, err := renderConfig(configParams{
-		Node:        name,
-		Socket:      n.Socket,
-		LabBind:     labBind,
-		ProdBinds:   prodBinds,
-		ProxyBind:   proxyBind,
-		Responder:   l.Responder.Addr(),
-		PeriodMS:    millis(l.Period),
-		ExpireMS:    millis(ExpiryFactor * l.Period),
-		LabTable:    LabTable,
-		ProdTable:   ProdTable,
-		ProxyTable:  ProxyTable,
-		ClientHdr:   ClientHeader,
-		NodeHdr:     NodeHeader,
-		ListenerHdr: ListenerHeader,
-		KeyHdr:      KeyHeader,
-		LookupHdr:   LookupHeader,
-		AggName:     aggName,
-		AggAddr:     aggAddr,
-		PeersBind:   peersBind,
-		OutputFirst: outputFirst,
-		ProbeBind:   probeBind,
-		OutTable:    OutputTable,
-		MetaTable:   MetaTable,
-		MetaExpMS:   millis(MetaExpire),
-		OutSlots:    OutputSlots,
-		OutLimit:    OutputLimit,
-		LeaseMS:     output.LeaseWindowMillis,
-		ProbeHdrs:   probeHeaders(OutputTable, MetaTable),
+		Node:         name,
+		Socket:       n.Socket,
+		LabBind:      labBind,
+		ProdBinds:    prodBinds,
+		ProxyBind:    proxyBind,
+		Responder:    l.Responder.Addr(),
+		PeriodMS:     millis(l.Period),
+		ExpireMS:     millis(ExpiryFactor * l.Period),
+		LabTable:     LabTable,
+		ProdTable:    ProdTable,
+		ProxyTable:   ProxyTable,
+		ClientHdr:    ClientHeader,
+		NodeHdr:      NodeHeader,
+		ListenerHdr:  ListenerHeader,
+		KeyHdr:       KeyHeader,
+		LookupHdr:    LookupHeader,
+		AggName:      aggName,
+		AggAddr:      aggAddr,
+		PeersBind:    peersBind,
+		OutputFirst:  outputFirst,
+		ProbeBind:    probeBind,
+		OutTable:     OutputTable,
+		MetaTable:    MetaTable,
+		MetaExpMS:    millis(MetaExpire),
+		OutSlots:     OutputSlots,
+		OutLimit:     OutputLimit,
+		LeaseMS:      output.LeaseWindowMillis,
+		ProbeHdrs:    probeHeaders(OutputTable, MetaTable),
+		Limit:        limit,
+		AuthHdr:      AuthorityHeader,
+		DenyHdr:      DenyHeader,
+		LocalRateHdr: LocalRateHeader,
+		AggRateHdr:   AggRateHeader,
 	})
 	if err != nil {
 		return nil, err

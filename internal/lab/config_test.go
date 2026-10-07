@@ -99,7 +99,13 @@ func TestConfigValidates(t *testing.T) {
 	agg := withAggregator(base, "127.0.0.1:10004", "127.0.0.1:10005")
 	first := agg
 	first.OutputFirst = true
-	for name, p := range map[string]configParams{"plain": base, "aggregator": agg, "output first": first} {
+	enforcing := agg
+	enforcing.Limit = 100
+	enforcing.AuthHdr, enforcing.DenyHdr = AuthorityHeader, DenyHeader
+	enforcing.LocalRateHdr, enforcing.AggRateHdr = LocalRateHeader, AggRateHeader
+	for name, p := range map[string]configParams{
+		"plain": base, "aggregator": agg, "output first": first, "enforcing": enforcing,
+	} {
 		cfg, err := renderConfig(p)
 		if err != nil {
 			t.Fatal(err)

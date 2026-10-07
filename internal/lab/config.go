@@ -84,6 +84,15 @@ const (
 	// exists to show what that weaker rule would decide; nothing
 	// enforces it.
 	RelativeAuthorityHeader = "X-Lab-Relative-Authority"
+	// With Aggregator.Limit set, the lab listener enforces and answers
+	// with its decision: AuthorityHeader as on the probe listener, the
+	// limit that denied the request in DenyHeader ("local", "aggregate",
+	// or empty when none did), the local http_req_rate after tracking
+	// the request in LocalRateHeader, and the aggregate output's rate
+	// slot in AggRateHeader (0 for a missing entry).
+	DenyHeader      = "X-Lab-Deny"
+	LocalRateHeader = "X-Lab-Local-Rate"
+	AggRateHeader   = "X-Lab-Agg-Rate"
 )
 
 // ExpiryFactor is how many rate periods a table entry outlives its last
@@ -127,6 +136,12 @@ type configParams struct {
 	OutSlots    int
 	OutLimit    int
 	LeaseMS     int
+	// Enforcement response headers.
+	AuthHdr, DenyHdr, LocalRateHdr, AggRateHdr string
+	// Limit, when non-zero, makes the lab listener enforce the full
+	// per-proxy threshold: locally always, on the aggregate output while
+	// it is authoritative.
+	Limit int
 }
 
 // The key expression is stored once in txn.lab_key and reused for tracking,
@@ -179,6 +194,7 @@ frontend lab
     http-request set-var(txn.lab_key) req.hdr_ip({{.ClientHdr}}),ipmask(32,64) if { req.hdr_cnt({{.ClientHdr}}) eq 1 }
     http-request deny deny_status 400 unless { var(txn.lab_key) -m found }
     http-request track-sc0 var(txn.lab_key) table {{.LabTable}}
+{{- if .Limit}}{{template "enforce" .}}{{end}}
     http-request set-header {{.NodeHdr}} {{.Node}}
     http-request set-header {{.ListenerHdr}} lab
     http-request set-header {{.KeyHdr}} %[var(txn.lab_key)]
@@ -243,6 +259,33 @@ frontend probe
 
 backend responder
     server responder {{.Responder}}
+{{- define "enforce"}}
+    # Enforcement (phase 10), with the frozen phase 06 authority rule.
+    http-request set-var(txn.lab_lrate) sc_http_req_rate(0)
+    http-request set-var(txn.agg_now) date(0,ms),and(4294967295)
+    http-request set-var(txn.agg_left) ipv6(::),table_gpt(1,{{.MetaTable}}),sub(txn.agg_now),and(4294967295)
+    http-request set-var(txn.agg_gen) ipv6(::),table_gpt(2,{{.MetaTable}})
+    acl agg_meta  ipv6(::),table_gpt(0,{{.MetaTable}}) eq 2
+    acl agg_lease var(txn.agg_left) -m int le {{.LeaseMS}}
+    acl agg_v2    var(txn.lab_key),table_gpt(0,{{.OutTable}}) eq 2
+    acl agg_gen   var(txn.lab_key),table_gpt(2,{{.OutTable}}),sub(txn.agg_gen) eq 0
+    acl agg_over  var(txn.lab_key),table_gpt(1,{{.OutTable}}) ge {{.Limit}}
+    acl local_over var(txn.lab_lrate) -m int ge {{.Limit}}
+    http-request set-var(txn.lab_auth) str(aggregate) if agg_meta agg_lease agg_v2 agg_gen
+    http-request set-var(txn.lab_auth) str(local) unless agg_meta agg_lease agg_v2 agg_gen
+    # Local protection: always active, with the full per-proxy limit,
+    # never divided by the number of proxies.
+    http-request set-var(txn.lab_deny) str(local) if local_over
+    http-request deny deny_status 429 if local_over
+    # Aggregate protection: the same limit on the cluster-wide rate, only
+    # while the output is authoritative.
+    http-request set-var(txn.lab_deny) str(aggregate) if agg_meta agg_lease agg_v2 agg_gen agg_over
+    http-request deny deny_status 429 if agg_meta agg_lease agg_v2 agg_gen agg_over
+    http-after-response set-header {{.AuthHdr}} %[var(txn.lab_auth)]
+    http-after-response set-header {{.DenyHdr}} %[var(txn.lab_deny)]
+    http-after-response set-header {{.LocalRateHdr}} %[var(txn.lab_lrate)]
+    http-after-response set-header {{.AggRateHdr}} %[var(txn.lab_key),table_gpt(1,{{.OutTable}})]
+{{- end}}
 {{- define "outputs"}}
 
 # Output tables, written only by the aggregator over the peers protocol.

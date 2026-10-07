@@ -3,8 +3,10 @@ package sources_test
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -526,5 +528,295 @@ func TestOutputRetire(t *testing.T) {
 	}
 	if g2 == g || st.Rotations != 1 || !slices.Equal(got, want) {
 		t.Fatalf("after Retire (generation %d -> %d, %d rotations) sent %q, want %q", g, g2, st.Rotations, got, want)
+	}
+}
+
+// smallBuffers shrinks the kernel send buffer of every accepted
+// connection, so that a source that stops reading backs the daemon's
+// writes up at once.
+type smallBuffers struct{ net.Listener }
+
+func (l smallBuffers) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetWriteBuffer(4096)
+	}
+	return c, err
+}
+
+// TestOutputBacklog checks a source that stops reading: the session keeps
+// reading and accepting its input, defers output once more than
+// peersession.SoftBacklog bytes wait, so its queue stays bounded however
+// much is published, and once the source reads again it receives each
+// key's latest value (superseded values coalesced) and then a marker.
+func TestOutputBacklog(t *testing.T) {
+	store := newStore(t)
+	cfg := fastConfig(config.Source{Name: "a"})
+	cfg.Outputs = outCfg
+	cfg.IdleTimeout = 30 * time.Second // the writer's deadline per write
+	ln := smallBuffers{listen(t)}
+	m, r := startManager(t, sources.Options{Config: cfg, Listener: ln, Output: store, OutputRefresh: -1})
+	f := connectFake(t, ln.Addr().String(), "a")
+	if tc, ok := f.conn.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(4096)
+	}
+	f.established()
+	in := peermsg.NewInbound(8)
+	isMeta := func(m daemonMsg) bool { u, ok := m.msg.(peermsg.UpdateMessage); return ok && u.Table == "t_meta" }
+	if err := m.SetLease(time.Now().Add(output.MaxLeaseLength)); err != nil {
+		t.Fatal(err)
+	}
+	f.define(2, aggDef)
+	f.define(3, metaDef)
+	readDaemon(f, in, isMeta)
+	f.define(1, inDef) // selects t_in for the updates below
+
+	const keys = 2000
+	ks := make([]peermsg.Key, keys)
+	for i := range ks {
+		ks[i] = mustKey(t, fmt.Sprintf("2001:db8:%x::", i+1))
+	}
+	// The source stops reading but keeps sending input.
+	rounds, sentUpdates, deferredAt := 0, 0, 0
+	var st peersession.Stats
+	for deadline := time.Now().Add(20 * time.Second); ; {
+		rounds++
+		for _, k := range ks {
+			if err := store.Set("t_out", k, output.AggregateValues(uint32(rounds))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := m.SetLease(time.Now().Add(output.MaxLeaseLength)); err != nil {
+			t.Fatal(err)
+		}
+		sentUpdates++
+		f.update(inDef, peermsg.UpdateID(sentUpdates), "2001:db8::", uint32(sentUpdates))
+		time.Sleep(20 * time.Millisecond)
+		st = status(t, m, "a").Stats
+		if st.OutDeferred > 0 && deferredAt == 0 {
+			deferredAt = rounds
+		}
+		// Ten more rounds once deferred, within the writer's deadline.
+		if deferredAt > 0 && rounds >= deferredAt+10 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no output deferred after %d rounds: %+v", rounds, st)
+		}
+	}
+	// One round is at most every key once: about 30 bytes each.
+	if bound := int64(peersession.SoftBacklog + 2*keys*40); st.MaxOutQueued > bound {
+		t.Errorf("queue reached %d bytes, bound %d", st.MaxOutQueued, bound)
+	}
+	r.waitFor("input read during the backlog", fakeTimeout, func(evs []sources.Event) bool {
+		return count[peersession.EntryUpdated](evs, "a") == sentUpdates
+	})
+	t.Logf("%d rounds of %d keys published, deferred from round %d; queue %d bytes (max %d); %d input updates "+
+		"accepted", rounds, keys, deferredAt, st.OutQueued, st.MaxOutQueued, sentUpdates)
+
+	// The source reads again: every key's latest value arrives, then a
+	// marker certifying it. The publisher keeps renewing meanwhile.
+	renewing := make(chan struct{})
+	renewed := make(chan struct{})
+	go func() {
+		defer close(renewed)
+		for {
+			select {
+			case <-renewing:
+				return
+			case <-time.After(200 * time.Millisecond):
+				_ = m.SetLease(time.Now().Add(output.MaxLeaseLength))
+			}
+		}
+	}()
+	defer func() { close(renewing); <-renewed }()
+	latest := map[peermsg.Key]uint32{}
+	updates := 0
+	readDaemon(f, in, func(dm daemonMsg) bool {
+		u, ok := dm.msg.(peermsg.UpdateMessage)
+		if !ok {
+			return false
+		}
+		if u.Table == "t_out" {
+			updates++
+			latest[u.Update.Key] = u.Update.Values[0].Array[output.SlotRate]
+			return false
+		}
+		if len(latest) < keys {
+			return false
+		}
+		for _, v := range latest {
+			if v != uint32(rounds) {
+				return false
+			}
+		}
+		return true
+	})
+	if updates >= rounds*keys {
+		t.Errorf("%d updates for %d rounds of %d keys: nothing coalesced", updates, rounds, keys)
+	}
+	t.Logf("after the backlog: %d updates carried %d rounds of %d keys", updates, rounds, keys)
+	if st := status(t, m, "a"); !st.Up || st.Session != 1 {
+		t.Fatalf("session did not survive the backlog: %+v", st)
+	}
+}
+
+// TestLiveMarkerStat checks Stats.LiveMarker, which tells shutdown whether
+// a session's source may hold authority: false before any marker, true
+// once a lease marker is written, true while a later revocation waits
+// behind a backlog, false once the revocation is written, and never true
+// without a metadata table, where no marker is ever written.
+func TestLiveMarkerStat(t *testing.T) {
+	t.Run("metadata", func(t *testing.T) {
+		store := newStore(t)
+		m, _, addr := outputManager(t, store)
+		f := connectFake(t, addr, "a")
+		f.established()
+		in := peermsg.NewInbound(8)
+		isMeta := func(m daemonMsg) bool { u, ok := m.msg.(peermsg.UpdateMessage); return ok && u.Table == "t_meta" }
+		f.define(2, aggDef)
+		f.define(3, metaDef)
+		readDaemon(f, in, func(dm daemonMsg) bool {
+			d, ok := dm.msg.(peermsg.DefinitionMessage)
+			return ok && d.Definition.Name == "t_meta"
+		})
+		if st := status(t, m, "a").Stats; st.LiveMarker || st.Markers != 0 {
+			t.Fatalf("before any lease: %+v", st)
+		}
+		if err := m.SetLease(time.Now().Add(output.MaxLeaseLength)); err != nil {
+			t.Fatal(err)
+		}
+		readDaemon(f, in, isMeta)
+		waitStat(t, m, "lease marker", func(st peersession.Stats) bool { return st.LiveMarker && st.Markers == 1 })
+		m.Revoke()
+		readDaemon(f, in, isMeta)
+		waitStat(t, m, "revocation", func(st peersession.Stats) bool { return !st.LiveMarker && st.Revocations == 1 })
+	})
+	t.Run("revocation behind a backlog", func(t *testing.T) {
+		store := newStore(t)
+		cfg := fastConfig(config.Source{Name: "a"})
+		cfg.Outputs = outCfg
+		cfg.IdleTimeout = 30 * time.Second
+		ln := smallBuffers{listen(t)}
+		m, _ := startManager(t, sources.Options{Config: cfg, Listener: ln, Output: store, OutputRefresh: -1})
+		f := connectFake(t, ln.Addr().String(), "a")
+		if tc, ok := f.conn.(*net.TCPConn); ok {
+			_ = tc.SetReadBuffer(4096)
+		}
+		f.established()
+		in := peermsg.NewInbound(8)
+		isMeta := func(m daemonMsg) bool { u, ok := m.msg.(peermsg.UpdateMessage); return ok && u.Table == "t_meta" }
+		if err := m.SetLease(time.Now().Add(output.MaxLeaseLength)); err != nil {
+			t.Fatal(err)
+		}
+		f.define(2, aggDef)
+		f.define(3, metaDef)
+		readDaemon(f, in, isMeta)
+		waitStat(t, m, "lease marker", func(st peersession.Stats) bool { return st.LiveMarker })
+		// The source stops reading; output piles up ahead of the
+		// revocation.
+		for i := range 4000 {
+			if err := store.Set("t_out", mustKey(t, fmt.Sprintf("2001:db8:%x::", i+1)), output.AggregateValues(1)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		waitStat(t, m, "backlog", func(st peersession.Stats) bool { return st.OutQueued > 0 })
+		m.Revoke()
+		time.Sleep(100 * time.Millisecond)
+		if st := status(t, m, "a").Stats; !st.LiveMarker {
+			t.Fatalf("revocation not written yet, but LiveMarker false: %+v", st)
+		}
+		// The source reads again: once the revocation is written the
+		// marker is withdrawn.
+		readDaemon(f, in, func(dm daemonMsg) bool {
+			u, ok := dm.msg.(peermsg.UpdateMessage)
+			return ok && u.Table == "t_meta" && u.Update.Values[0].Array[output.SlotGeneration] == 0
+		})
+		waitStat(t, m, "revocation written", func(st peersession.Stats) bool { return !st.LiveMarker })
+	})
+	t.Run("no metadata table", func(t *testing.T) {
+		cfg := config.Config{Outputs: outCfg[:1]}
+		store, err := output.NewStore(cfg.OutputTables(), output.StoreOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := fastConfig(config.Source{Name: "a"})
+		c.Outputs = outCfg[:1]
+		ln := listen(t)
+		m, _ := startManager(t, sources.Options{Config: c, Listener: ln, Output: store})
+		f := connectFake(t, ln.Addr().String(), "a")
+		f.established()
+		f.define(2, aggDef)
+		in := peermsg.NewInbound(8)
+		readDaemon(f, in, func(dm daemonMsg) bool { _, ok := dm.msg.(peermsg.DefinitionMessage); return ok })
+		for range 3 {
+			if err := m.SetLease(time.Now().Add(output.MaxLeaseLength)); err != nil {
+				t.Fatal(err)
+			}
+			m.Revoke()
+		}
+		f.control(peerwire.ControlHeartbeat)
+		time.Sleep(50 * time.Millisecond)
+		if st := status(t, m, "a").Stats; st.LiveMarker || st.Markers != 0 || st.Revocations != 0 {
+			t.Fatalf("without a metadata table: %+v", st)
+		}
+	})
+}
+
+func waitStat(t *testing.T, m *sources.Manager, what string, pred func(peersession.Stats) bool) {
+	t.Helper()
+	for deadline := time.Now().Add(fakeTimeout); ; {
+		st := status(t, m, "a").Stats
+		if pred(st) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: %+v", what, st)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestOutputRetireBatch checks that retiring many keys as one batch costs
+// a session one generation rotation and one re-send, whatever the batch
+// size.
+func TestOutputRetireBatch(t *testing.T) {
+	store := newStore(t)
+	var ks []peermsg.Key
+	for i := 1; i <= 50; i++ {
+		k := mustKey(t, fmt.Sprintf("2001:db8:%x::", i))
+		ks = append(ks, k)
+		if err := store.Set("t_out", k, output.AggregateValues(5)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m, _, addr := outputManager(t, store)
+	f := connectFake(t, addr, "a")
+	f.established()
+	in := peermsg.NewInbound(8)
+	isMeta := func(m daemonMsg) bool { u, ok := m.msg.(peermsg.UpdateMessage); return ok && u.Table == "t_meta" }
+	if err := m.SetLease(time.Now().Add(output.MaxLeaseLength)); err != nil {
+		t.Fatal(err)
+	}
+	f.define(2, aggDef)
+	f.define(3, metaDef)
+	readDaemon(f, in, isMeta)
+	if err := store.RetireBatch(map[string][]peermsg.Key{"t_out": ks[1:]}); err != nil {
+		t.Fatal(err)
+	}
+	got := summarize(t, readDaemon(f, in, isMeta))
+	st := status(t, m, "a").Stats
+	updates := 0
+	for _, g := range got {
+		if strings.HasPrefix(g, "upd ") {
+			updates++
+		}
+	}
+	if st.Rotations != 1 || updates != 1 {
+		t.Fatalf("batch of 49: %d rotations, re-sent %q", st.Rotations, got)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if st := status(t, m, "a").Stats; st.Rotations != 1 {
+		t.Fatalf("%d rotations after the batch", st.Rotations)
 	}
 }

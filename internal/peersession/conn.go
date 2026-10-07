@@ -208,11 +208,24 @@ type Stats struct {
 	Revocations  uint64
 	LastMarker   time.Time
 	LastDeadline uint32
+	// LiveMarker reports that a live lease marker of this session may be
+	// outstanding at the source: a publish has read a live lease it may
+	// write, or one was queued and no revocation queued after it has been
+	// entirely written to the connection yet. False before the first live marker. A source whose
+	// LiveMarker is false holds no authority from this session.
+	LiveMarker bool
 	// Generation is the session's current output generation.
 	Generation uint32
 	// Rotations counts generation changes after Store.Retire, each with
 	// a full re-send of the output.
 	Rotations uint64
+	// OutQueued is how many bytes wait in the session's send queue, and
+	// MaxOutQueued the most that ever waited in this session.
+	OutQueued    int64
+	MaxOutQueued int64
+	// OutDeferred counts the backlogs during which output changes were
+	// deferred because more than SoftBacklog bytes waited.
+	OutDeferred uint64
 	// Outputs describes each output table, in local ID order.
 	Outputs []OutputStats
 }
@@ -292,6 +305,9 @@ type Conn struct {
 	revocations    atomic.Uint64
 	markerNano     atomic.Int64
 	markerDL       atomic.Uint32
+	liveGen        atomic.Uint64 // live markers queued (or being queued)
+	revWritten     atomic.Uint64 // liveGen covered by a fully written revocation
+	markerPending  atomic.Bool   // publish read a live lease and may write it
 
 	// leaseSent is the lease generation last written (0: none), and
 	// markerDue forces the next publish to write the lease again, after
@@ -302,6 +318,16 @@ type Conn struct {
 	// every output table is taught.
 	refreshAt time.Time
 	refreshes atomic.Uint64
+
+	// wq is the established session's send queue (nil during the
+	// handshake, whose writes are synchronous). outBlocked asks its
+	// writer to wake Run once a backlog drains, and outPending remembers
+	// an output change deferred meanwhile.
+	wq         *sendQueue
+	wqA        atomic.Pointer[sendQueue] // wq, for Stats
+	outBlocked atomic.Bool
+	outPending bool
+	deferred   atomic.Uint64
 
 	// gen is the session's current output generation, changed only when
 	// a Retire is seen (retiredSeen is the store's count then).
@@ -467,9 +493,14 @@ func (c *Conn) Stats() Stats {
 		Markers:         c.markers.Load(),
 		Revocations:     c.revocations.Load(),
 		LastDeadline:    c.markerDL.Load(),
+		LiveMarker:      c.markerPending.Load() || c.liveGen.Load() > c.revWritten.Load(),
 		Generation:      c.genA.Load(),
 		Rotations:       c.rotations.Load(),
 		Refreshes:       c.refreshes.Load(),
+		OutDeferred:     c.deferred.Load(),
+	}
+	if q := c.wqA.Load(); q != nil {
+		s.OutQueued, s.MaxOutQueued = q.queued.Load(), q.maxSeen.Load()
 	}
 	if n := c.lastRxMono.Load(); n != 0 {
 		s.LastRx = monoBase.Add(time.Duration(n))
@@ -530,7 +561,13 @@ func (c *Conn) watch(ctx context.Context) func() bool {
 	return context.AfterFunc(ctx, func() { _ = c.nc.SetDeadline(aLongTimeAgo) })
 }
 
+// write sends b: during the handshake directly, with deadline; once
+// established through the send queue, whose writer applies the idle
+// timeout to each write.
 func (c *Conn) write(ctx context.Context, b []byte, deadline time.Time) error {
+	if c.wq != nil {
+		return c.enqueue(b)
+	}
 	if err := c.nc.SetWriteDeadline(deadline); err != nil {
 		return wrapCause(ErrIO, err, "set write deadline")
 	}
@@ -561,6 +598,9 @@ func (c *Conn) fill(ctx context.Context, deadline time.Time) error {
 	}
 	if c.outWake.Load() {
 		return errDeadline // the output changed before this deadline was set
+	}
+	if c.wq != nil && c.wq.failed.Load() {
+		return errDeadline // the writer failed before this deadline was set
 	}
 	n, err := c.nc.Read(c.buf[:min(len(c.buf), c.dec.Free())])
 	if n > 0 {

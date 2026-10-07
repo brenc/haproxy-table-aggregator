@@ -22,7 +22,6 @@ import (
 	"github.com/brenc/haproxy-table-aggregator/internal/lab/labtest"
 	"github.com/brenc/haproxy-table-aggregator/internal/peermsg"
 	"github.com/brenc/haproxy-table-aggregator/internal/peerwire"
-	"github.com/brenc/haproxy-table-aggregator/internal/sources"
 )
 
 // envChild makes the test binary run main instead of the tests, so the
@@ -119,9 +118,9 @@ func TestRunEvents(t *testing.T) {
 	addr := make(chan string, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- runWith(ctx, []string{"-config", cfg}, &out, &errOut, func(m *sources.Manager) {
-			addr <- m.Addr().String()
-		})
+		done <- runWith(ctx, []string{"-config", cfg}, &out, &errOut, hooks{ready: func(d *daemon) {
+			addr <- d.m.Addr().String()
+		}})
 	}()
 	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", <-addr)
 	if err != nil {
@@ -222,8 +221,8 @@ func TestLiveSIGTERM(t *testing.T) {
 	cfg := writeConfig(t, fmt.Sprintf(`{"local_peer": "agg", "insecure_plaintext_loopback_lab": true,
 		"listen": %q, "sources": [{"name": "a"}, {"name": "b", "address": %q}],
 		"tables": [{"name": %q, "period": "10s"}], "idle_timeout": "4s",
-		"outputs": [{"name": %q, "kind": "aggregate", "expire": "30s"}, {"name": %q, "kind": "metadata", "expire": "2s"}]}`,
-		listenAddr, b.PeersAddr, lab.LabTable, lab.OutputTable, lab.MetaTable))
+		"outputs": [{"name": %q, "kind": "aggregate", "input": %q, "expire": "30s"}, {"name": %q, "kind": "metadata", "expire": "2s"}]}`,
+		listenAddr, b.PeersAddr, lab.LabTable, lab.OutputTable, lab.LabTable, lab.MetaTable))
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -356,9 +355,9 @@ func TestRunBlockedOutput(t *testing.T) {
 	addr := make(chan string, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- runWith(ctx, []string{"-config", cfg}, out, &errOut, func(m *sources.Manager) {
-			addr <- m.Addr().String()
-		})
+		done <- runWith(ctx, []string{"-config", cfg}, out, &errOut, hooks{ready: func(d *daemon) {
+			addr <- d.m.Addr().String()
+		}})
 	}()
 	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", <-addr)
 	if err != nil {
@@ -522,7 +521,7 @@ func TestSignalledDuringStartup(t *testing.T) {
 	cancel()
 	started := false
 	var out, errOut syncBuffer
-	err := runWith(ctx, []string{"-config", cfg}, &out, &errOut, func(*sources.Manager) { started = true })
+	err := runWith(ctx, []string{"-config", cfg}, &out, &errOut, hooks{ready: func(*daemon) { started = true }})
 	if err != nil || started || out.String() != "" {
 		t.Fatalf("run: %v, started %v, output %q", err, started, out.String())
 	}
