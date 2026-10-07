@@ -240,7 +240,12 @@ func TestLiveCounterTotals(t *testing.T) {
 		c.LastDecrease.To)
 
 	// Node b's other key expires with no further traffic and leaves the
-	// total once.
+	// total once. One more request on node b first keeps its entry for
+	// the first key alive past that expiry: when both nodes answer the
+	// first resync "finished", the two entries' deadlines can fall within
+	// the 100 ms margin below, and both would expire.
+	sendTraffic(t, b.LabAddr, client, 1)
+	lt.wait("b refreshed the first key", k, bCount+1)
 	e, ok := store.Lookup("b", lab.LabTable, k2)
 	if !ok {
 		t.Fatal("b's entry for the second key expired early")
