@@ -30,6 +30,17 @@ consumers, with explicit degradation instead of silently incomplete results.
   scan every entry (O(n)); `max_source_entries` (default 131072) is unmeasured;
   each "partial" resync reply triggers a full re-teach after 1 s
   (`sources.DefaultResyncRetry`), whose cost at scale is unmeasured.
+- Carried in from phase 11: an entry evicted at the source (LRU at a full
+  table, or a runtime clear) and recreated by traffic in the same session
+  replaces the retained entry; a lower count is only recorded as a
+  decrease, its lost history (rate included) is dropped without degrading
+  the source, and the aggregate understates until that history decays.
+  Across sessions the same case is lost history (source Degraded); within
+  a session it is indistinguishable from a reset or 32-bit wrap. Decide
+  the within-session policy with the eviction tests. Also: a publisher
+  pass is O(keys × entries) (each `KeyView` builds a roster that scans
+  every entry for expiry); after a restart with 2000 retained keys the
+  first pass outlasted its 1 s lease under the race detector.
 
 ## Acceptance
 
