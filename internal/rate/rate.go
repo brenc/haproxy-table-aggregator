@@ -226,6 +226,31 @@ func (c Counter) Next(at time.Time) (time.Time, bool) {
 // Empty reports that the counter holds no events: it reads 0 at any age.
 func (c Counter) Empty() bool { return c.Value.Curr == 0 && c.Value.Prev == 0 }
 
+// ZeroAt returns the earliest local time from which the counter reads 0
+// and keeps reading 0 without new events: Received for an empty counter
+// or one that already reads 0, and at the latest once its age exceeds two
+// periods. Every event it counted is then outside the window its reading
+// covers. The reading is non-increasing in the age, so the first zero
+// is found by binary search, as Next finds the first drop.
+func (c Counter) ZeroAt() time.Time {
+	age := uint64(c.Value.Age)
+	if Estimate(c.Value.Curr, c.Value.Prev, c.Period, age) == 0 {
+		return c.Received
+	}
+	lo, hi := age, 2*uint64(c.Period)+1 // reads > 0 at lo, 0 at hi
+	for hi-lo > 1 {
+		mid := lo + (hi-lo)/2
+		if Estimate(c.Value.Curr, c.Value.Prev, c.Period, mid) == 0 {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	// hi - age <= 2*MaxPeriod+1 < 2^33 ms fits a Duration.
+	//nolint:gosec // G115: bounded above.
+	return c.Received.Add(time.Duration(hi-age) * time.Millisecond)
+}
+
 // AgeInRange reports whether the sender's native reading of the counter
 // was the specified one when it was sent: the counter is empty or its
 // wire age is at most MaxAge(Period).

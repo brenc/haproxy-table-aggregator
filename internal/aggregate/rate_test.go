@@ -49,7 +49,10 @@ func newRateHarness(t *testing.T, p peermsg.Millis, offsets map[string]uint32, r
 	}
 	h := &rateHarness{
 		t: t, p: p, clock: c, start: c.Now(), s: s, roster: roster,
-		o:   &aggregatetest.Oracle{Health: healthTO, Tables: []string{inTable}},
+		o: &aggregatetest.Oracle{
+			Health: healthTO, Tables: []string{inTable}, Capacity: 16, Grace: snapshot.LossGrace,
+			Periods: map[string]uint32{inTable: uint32(p)},
+		},
 		src: map[string]*ratetest.Source{}, offset: offsets,
 	}
 	for _, name := range roster {
@@ -345,8 +348,9 @@ func TestRateNextIncludesExpiry(t *testing.T) {
 }
 
 // TestRateCompleteness: only Ready sources count, an incomplete rate is
-// not authoritative, and a held-over or out-of-range contribution makes
-// the rate uncertain.
+// not authoritative, a held-over entry is never counted, and a source
+// whose snapshot lost an entry is not Ready until that entry's estimate
+// would have decayed to 0.
 func TestRateCompleteness(t *testing.T) {
 	forEachRatePeriod(t, func(t *testing.T, p peermsg.Millis) {
 		h := newRateHarness(t, p, map[string]uint32{"a": 7, "b": 8}, "a", "b")
@@ -367,21 +371,50 @@ func TestRateCompleteness(t *testing.T) {
 		if _, err := r.Authoritative(); !errors.Is(err, aggregate.ErrIncomplete) {
 			t.Fatalf("incomplete rate authoritative: %v", err)
 		}
-		// Session 2 syncs without re-teaching the key: held over.
+		// Session 2 syncs without re-teaching the key: its entry is
+		// released as lost history, and b stays degraded (the rate is
+		// not complete) until the lost estimate would have reached 0.
 		now := h.clock.Now()
 		h.must("b", 2, peersession.SessionUp{Direction: peersession.Inbound, At: now})
 		h.must("b", 2, peersession.TableDefined{ID: 1, Definition: h.def(), Received: now})
 		r = h.rate(k)
-		if c := contributionRate(t, r, "b"); c.State != snapshot.Syncing || c.Counted {
-			t.Fatalf("syncing source counted: %+v", c)
+		if c := contributionRate(t, r, "b"); c.State != snapshot.Syncing || c.Counted || !c.HeldOver {
+			t.Fatalf("syncing source: %+v", c)
 		}
 		h.must("b", 2, peersession.SyncFinished{Received: now})
 		r = h.rate(k)
-		if c := contributionRate(t, r, "b"); !c.Counted || !c.HeldOver || !r.Uncertain || !r.Complete {
-			t.Fatalf("held-over entry: %+v, rate %+v", c, r)
+		if c := contributionRate(t, r, "b"); c.State != snapshot.Degraded || c.Present || r.Complete {
+			t.Fatalf("lost entry: %+v, rate %+v", c, r)
+		}
+		if _, err := r.Authoritative(); !errors.Is(err, aggregate.ErrIncomplete) {
+			t.Fatalf("rate without the lost history authoritative: %v", err)
+		}
+		rep, _ := h.s.Source("b")
+		if rep.Loss.Absent != 1 || rep.Released != 1 || !rep.Loss.RateUntil.After(now) {
+			t.Fatalf("source b: %+v", rep)
+		}
+		until := rep.Loss.RateUntil
+		step := func(d time.Duration) {
+			h.clock.Advance(d)
+			for name, sess := range map[string]uint64{"a": 1, "b": 2} {
+				h.s.Observe(name, sess, h.clock.Now())
+				h.o.Observe(name, sess, h.clock.Now())
+			}
+		}
+		for h.clock.Now().Add(4 * time.Second).Before(until) {
+			step(4 * time.Second)
+		}
+		step(until.Sub(h.clock.Now()) - time.Millisecond)
+		if r = h.rate(k); r.Complete {
+			t.Fatalf("complete 1 ms before the lost history decayed: %+v", r)
+		}
+		step(time.Millisecond)
+		r = h.rate(k)
+		if c := contributionRate(t, r, "b"); c.State != snapshot.Ready || !r.Complete || r.Uncertain {
+			t.Fatalf("after the lost history decayed: %+v, rate %+v", c, r)
 		}
 		if _, err := r.Authoritative(); err != nil {
-			t.Fatalf("uncertain is not an error: %v", err)
+			t.Fatalf("complete rate: %v", err)
 		}
 	})
 }

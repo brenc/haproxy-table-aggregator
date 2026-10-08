@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/brenc/haproxy-table-aggregator/internal/aggregate"
-	"github.com/brenc/haproxy-table-aggregator/internal/aggregate/aggregatetest"
 	"github.com/brenc/haproxy-table-aggregator/internal/config"
 	"github.com/brenc/haproxy-table-aggregator/internal/lab"
 	"github.com/brenc/haproxy-table-aggregator/internal/lab/labtest"
@@ -103,7 +102,7 @@ func liveRates(t *testing.T, rc rateCase) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oracle := &aggregatetest.Oracle{Health: cfg.HealthTimeout, Tables: []string{lab.LabTable}}
+	oracle := liveOracle(cfg)
 	apply := func(ev sources.Event) error {
 		applyErr := store.Apply(ev)
 		oracle.Record(ev, applyErr)

@@ -159,8 +159,10 @@ type Config struct {
 	// long ago (see package snapshot).
 	HealthTimeout time.Duration
 	// MaxSourceEntries bounds the snapshot entries kept for one source,
-	// across its input tables. An update that would exceed it is refused
-	// and degrades the source.
+	// across its input tables. A new key that would exceed it first
+	// releases the source's entries that only an earlier session
+	// delivered; if that is not enough, the update is refused and
+	// degrades the source (see package snapshot).
 	MaxSourceEntries int
 }
 

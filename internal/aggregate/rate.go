@@ -44,7 +44,8 @@ type RateContribution struct {
 	// entry is Present and the source Ready.
 	Counted bool
 	// HeldOver reports a Present entry delivered by an earlier session
-	// than the source's current one (see Contribution.HeldOver).
+	// than the source's current one (see Contribution.HeldOver); it is
+	// never Counted.
 	HeldOver bool
 	// AgeOutOfRange reports a non-empty counter whose wire age exceeded
 	// rate.MaxAge(Period), so its sender's native reading was not the
@@ -75,8 +76,10 @@ type RateTotal struct {
 	Sum uint64
 	// Complete reports that every configured source was Ready at At.
 	Complete bool
-	// Uncertain reports a counted contribution that is HeldOver or
-	// AgeOutOfRange.
+	// Uncertain reports a counted contribution that is HeldOver (which a
+	// Ready source cannot hold; kept as a defensive check) or
+	// AgeOutOfRange. Lost history does not make a rate uncertain: the
+	// source is not Ready until it could no longer change one.
 	Uncertain bool
 	// Next is the earliest Next of the counted contributions: until then
 	// Sum stays the same unless new input arrives or a source changes

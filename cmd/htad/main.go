@@ -7,7 +7,10 @@
 // enforces locally from those tables; nothing calls the daemon per
 // request. It also writes each validated session and table event to
 // stdout as one JSON object per line, logs source state changes, roster
-// readiness, and authority changes, and keeps no state across restarts.
+// readiness, and authority changes, and keeps no state across restarts:
+// a restarted daemon rebuilds every source's snapshot from the full
+// resync it requests and grants no authority until every source has
+// finished one (package snapshot, Recovery).
 //
 //	htad -config htad.json [-log-level info]
 //
@@ -172,6 +175,14 @@ func start(ctx context.Context, cfg config.Config, log *slog.Logger, h hooks) (*
 		}
 		apply = d.pub.Apply
 	}
+	if h.applied != nil {
+		inner := apply
+		apply = func(ev sources.Event) error {
+			applyErr := inner(ev)
+			h.applied(ev, applyErr)
+			return applyErr
+		}
+	}
 	var ln net.Listener
 	if h.listener != nil && cfg.Listen != "" {
 		var lc net.ListenConfig
@@ -216,6 +227,9 @@ type hooks struct {
 	listener func(net.Listener) net.Listener
 	// publish adjusts the publisher's options.
 	publish func(*publish.Options)
+	// applied sees every session event after the store applied it, with
+	// the store's verdict, in wire order per source.
+	applied func(sources.Event, error)
 }
 
 // runWith is run with test hooks.

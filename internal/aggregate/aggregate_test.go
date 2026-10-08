@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,7 +62,10 @@ func newHarness(t *testing.T, capacity int, srcs ...string) *harness {
 	}
 	return &harness{
 		t: t, clock: c, s: s, roster: srcs,
-		o: &aggregatetest.Oracle{Health: healthTO, Tables: []string{inTable, inTable2}},
+		o: &aggregatetest.Oracle{
+			Health: healthTO, Tables: []string{inTable, inTable2}, Capacity: capacity, Grace: snapshot.LossGrace,
+			Periods: map[string]uint32{inTable: uint32(period), inTable2: uint32(period)},
+		},
 	}
 }
 
@@ -100,13 +104,13 @@ func (h *harness) down(src string, session uint64) {
 	h.must(src, session, peersession.SessionDown{Err: errors.New("closed"), At: h.clock.Now()})
 }
 
-// sync brings a source's new session to a finished resync with both
-// input tables defined and nothing taught.
-func (h *harness) sync(src string, session uint64) {
+// sync brings a source's session 1 to a finished resync with both input
+// tables defined and nothing taught.
+func (h *harness) sync(src string) {
 	h.t.Helper()
-	h.up(src, session)
-	h.defineAll(src, session)
-	h.finish(src, session, false)
+	h.up(src, 1)
+	h.defineAll(src, 1)
+	h.finish(src, 1, false)
 }
 
 // observe records a message read now (a heartbeat) for the session.
@@ -202,8 +206,8 @@ func contribution(t *testing.T, tot aggregate.Total, src string) aggregate.Contr
 func TestReplacementNotAdditive(t *testing.T) {
 	h := newHarness(t, 16, "a", "b")
 	k := key(t, "2001:db8::")
-	h.sync("a", 1)
-	h.sync("b", 1)
+	h.sync("a")
+	h.sync("b")
 	h.want(k, 0, true)
 	h.set("a", 1, k, 10)
 	h.want(k, 10, true)
@@ -231,8 +235,8 @@ func TestEachIncrementsOnce(t *testing.T) {
 	for _, order := range [][]string{{"a", "b"}, {"b", "a"}} {
 		h := newHarness(t, 16, "a", "b")
 		k := key(t, "2001:db8::")
-		h.sync("a", 1)
-		h.sync("b", 1)
+		h.sync("a")
+		h.sync("b")
 		h.set("a", 1, k, 100)
 		h.set("b", 1, k, 100)
 		h.want(k, 200, true)
@@ -250,7 +254,7 @@ func TestEachIncrementsOnce(t *testing.T) {
 func TestRepeatedFullSnapshots(t *testing.T) {
 	h := newHarness(t, 16, "a", "b")
 	k, k2 := key(t, "2001:db8::"), key(t, "2001:db8:1::")
-	h.sync("b", 1)
+	h.sync("b")
 	h.set("b", 1, k, 20)
 	h.up("a", 1)
 	h.defineAll("a", 1)
@@ -291,7 +295,7 @@ func TestRepeatedFullSnapshots(t *testing.T) {
 func TestIsolation(t *testing.T) {
 	h := newHarness(t, 16, "a", "b")
 	k1, k2 := key(t, "2001:db8::"), key(t, "2001:db8:1::")
-	h.sync("a", 1)
+	h.sync("a")
 	// Source b numbers its tables the other way round: its ID 1 is t_in2.
 	h.up("b", 1)
 	h.must("b", 1, peersession.TableDefined{ID: 1, Definition: definition(inTable2), Received: h.clock.Now()})
@@ -334,8 +338,8 @@ func TestIsolation(t *testing.T) {
 func TestExpiredAndReplacedOnce(t *testing.T) {
 	h := newHarness(t, 16, "a", "b")
 	k := key(t, "2001:db8::")
-	h.sync("a", 1)
-	h.sync("b", 1)
+	h.sync("a")
+	h.sync("b")
 	h.set("a", 1, k, 10)
 	h.clock.Advance(10 * time.Second)
 	h.observe("a", 1)
@@ -387,8 +391,8 @@ func TestExpiredAndReplacedOnce(t *testing.T) {
 func TestDecreaseAndBoundary(t *testing.T) {
 	h := newHarness(t, 16, "a", "b")
 	k := key(t, "2001:db8::")
-	h.sync("a", 1)
-	h.sync("b", 1)
+	h.sync("a")
+	h.sync("b")
 	h.set("b", 1, k, 20)
 
 	h.set("a", 1, k, math.MaxUint32-1)
@@ -427,25 +431,35 @@ func TestDecreaseAndBoundary(t *testing.T) {
 		t.Fatalf("reset: %+v", c)
 	}
 
-	// A recreation reported by a later session: lower value, new session.
+	// A recreation reported by a later session: lower value, new
+	// session. The source lost the old entry's history, so it stays
+	// degraded while that history could still change its rate (phase
+	// 11), and its counts are uncertain until the old entry's deadline.
 	h.down("a", 1)
 	h.want(k, 3, false)
 	h.up("a", 2)
 	h.defineAll("a", 2)
 	h.teach("a", 2, k, 2, 30000)
 	h.finish("a", 2, false)
-	tot = h.want(k, 5, true)
+	tot = h.want(k, 3, false)
 	c = contribution(t, tot, "a")
 	if c.Decreases != 2 || c.LastDecrease.From != 5 || c.LastDecrease.To != 2 || c.LastDecrease.FromSession != 1 ||
-		c.LastDecrease.ToSession != 2 {
+		c.LastDecrease.ToSession != 2 || c.State != snapshot.Degraded || c.Counted || !c.HistoryLost {
 		t.Fatalf("recreation in a later session: %+v", c)
 	}
-	if r, _ := h.s.Source("a"); r.Decreases != 2 {
-		t.Fatalf("source a decreases %d, want 2", r.Decreases)
+	if r, _ := h.s.Source("a"); r.Decreases != 2 || r.Loss.Recreated != 1 || r.Loss.Absent != 0 {
+		t.Fatalf("source a decreases %d, loss %+v", r.Decreases, r.Loss)
+	}
+	h.clock.Advance(20100 * time.Millisecond) // past 2P+1 ms after session 2 came up
+	h.observe("a", 2)
+	h.observe("b", 1)
+	tot = h.want(k, 5, true)
+	if c = contribution(t, tot, "a"); !tot.Uncertain || !c.HistoryLost || !c.Counted {
+		t.Fatalf("after the rate window: total %+v, contribution %+v", tot, c)
 	}
 
 	// Uncertainty ends with the entries.
-	h.clock.Advance(30 * time.Second)
+	h.clock.Advance(10 * time.Second)
 	h.observe("a", 2)
 	h.observe("b", 1)
 	h.set("a", 2, k, 1)
@@ -484,12 +498,12 @@ func TestCompleteness(t *testing.T) {
 			t.Fatalf("initial contribution %+v", c)
 		}
 	}
-	h.sync("a", 1)
-	h.sync("b", 1)
+	h.sync("a")
+	h.sync("b")
 	h.set("a", 1, k, 10)
 	h.set("b", 1, k, 20)
 	h.want(k, 30, false) // c missing
-	h.sync("c", 1)
+	h.sync("c")
 	h.want(k, 30, true) // c Ready and empty: complete
 
 	// c syncing: its taught value is visible but not counted.
@@ -513,11 +527,20 @@ func TestCompleteness(t *testing.T) {
 		t.Fatalf("degraded b: %+v", c)
 	}
 	h.down("b", 1)
-	h.sync("b", 2)
-	// b's session 1 entry is held over: counted, but uncertain.
-	tot = h.want(k, 70, true)
-	if c := contribution(t, tot, "b"); !c.HeldOver || !c.Counted || !tot.Uncertain {
+	h.up("b", 2)
+	h.defineAll("b", 2)
+	// b's session 1 entry is held over until b's next finished resync
+	// (b is still degraded by its session 1 fault): visible, never
+	// counted.
+	tot = h.want(k, 50, false)
+	if c := contribution(t, tot, "b"); !c.HeldOver || c.Counted || c.State == snapshot.Ready {
 		t.Fatalf("held-over b: total %+v contribution %+v", tot, c)
+	}
+	h.teach("b", 2, k, 20, 29000)
+	h.finish("b", 2, false)
+	tot = h.want(k, 70, true)
+	if c := contribution(t, tot, "b"); c.HeldOver || !c.Counted || tot.Uncertain {
+		t.Fatalf("re-taught b: total %+v contribution %+v", tot, c)
 	}
 
 	// Silence degrades every source; heartbeats keep it Ready.
@@ -551,6 +574,7 @@ func TestRandomTraces(t *testing.T) {
 		snapshot.ErrSession, snapshot.ErrSchema, snapshot.ErrNotInput, snapshot.ErrUndefined, snapshot.ErrCapacity,
 	}
 	var dupUps, staleEvents, rejected, degradedRetained, uncertainComplete, nonzero2, nonzeroRates int
+	var absent, recreated, lossDegraded uint64
 	for seed := range uint64(40) {
 		rng := rand.New(rand.NewPCG(seed, 8))
 		// Capacity 4 of the 6 key/table slots, so new keys are refused.
@@ -645,6 +669,9 @@ func TestRandomTraces(t *testing.T) {
 						if c.Present && c.State == snapshot.Degraded {
 							degradedRetained++
 						}
+						if strings.HasPrefix(c.Reason, "history lost") {
+							lossDegraded++
+						}
 					}
 					if tot.Complete && tot.Uncertain {
 						uncertainComplete++
@@ -655,6 +682,15 @@ func TestRandomTraces(t *testing.T) {
 				}
 			}
 		}
+		for _, src := range h.s.Roster().Sources {
+			absent += src.Loss.Absent
+			recreated += src.Loss.Recreated
+		}
+	}
+	t.Logf("lost history: %d absent, %d recreated; reads of a source degraded by it %d", absent, recreated,
+		lossDegraded)
+	if absent == 0 || recreated == 0 || lossDegraded == 0 {
+		t.Error("trace never detected both kinds of lost history and degraded a source for it")
 	}
 	t.Logf("refusals %v; duplicate ups %d, earlier-session events %d, rejections %d; reads with a degraded "+
 		"source's retained entry %d, complete but uncertain %d, non-zero %s totals %d, non-zero complete rates %d", refusals,

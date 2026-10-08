@@ -29,8 +29,10 @@
 // frozen authority rule a missing key selects local protection, which
 // decides exactly as a zero aggregate would, because the aggregate limit
 // can only add denials to the local limit, which is always active.
-// Uncertain rates (a held-over entry from an earlier session, or an
-// out-of-range counter age) are published and counted in Stats.
+// Uncertain rates (an out-of-range counter age) are published and counted
+// in Stats. A source that lost history is not Ready while that loss could
+// change a rate (package snapshot, Recovery), so the lease is revoked
+// meanwhile rather than certifying a rate that lacks it.
 //
 // # Lease
 //

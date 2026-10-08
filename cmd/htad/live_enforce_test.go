@@ -37,10 +37,18 @@ type e2e struct {
 	errOut *syncBuffer
 	c      *lab.Client
 	stop   func()
+	cfg    string // the daemon's configuration file
 }
 
 // startE2E starts the lab and the daemon.
 func startE2E(t *testing.T, h hooks) *e2e {
+	t.Helper()
+	return startE2EWith(t, h, lab.Options{})
+}
+
+// startE2EWith starts the lab with opts (its aggregator filled in) and
+// the daemon.
+func startE2EWith(t *testing.T, h hooks, opts lab.Options) *e2e {
 	t.Helper()
 	var lc net.ListenConfig
 	ln, err := lc.Listen(context.Background(), "tcp4", "127.0.0.1:0")
@@ -49,15 +57,30 @@ func startE2E(t *testing.T, h hooks) *e2e {
 	}
 	closedAddr := ln.Addr().String()
 	_ = ln.Close()
-	l := labtest.Start(t, lab.Options{Aggregator: &lab.Aggregator{Name: "agg", Addr: closedAddr, Limit: limit}})
+	opts.Aggregator = &lab.Aggregator{Name: "agg", Addr: closedAddr, Limit: limit}
+	l := labtest.Start(t, opts)
 	e := &e2e{t: t, l: l, a: l.Node("a"), b: l.Node("b"), errOut: &syncBuffer{}}
 	srcs := fmt.Sprintf(`{"name": "a", "address": %q}, {"name": "b", "address": %q}`, e.a.PeersAddr, e.b.PeersAddr)
-	cfg := writeConfig(t, fmt.Sprintf(`{"local_peer": "agg", "insecure_plaintext_loopback_lab": true,
+	e.cfg = writeConfig(t, fmt.Sprintf(`{"local_peer": "agg", "insecure_plaintext_loopback_lab": true,
 		"sources": [%s], "tables": [{"name": %q, "period": "10s"}],
 		"outputs": [{"name": %q, "kind": "aggregate", "input": %q, "expire": "30s"},
 		            {"name": %q, "kind": "metadata", "expire": "2s"}],
 		"reconnect_min": "50ms", "reconnect_max": "500ms"}`,
 		srcs, lab.LabTable, lab.OutputTable, lab.LabTable, lab.MetaTable))
+	e.launch(h)
+	if e.c, err = lab.NewClient(nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(e.c.CloseIdle)
+	return e
+}
+
+// launch starts a daemon with empty memory on e's configuration, as a
+// restarted htad process would, and makes it e.d. The previous one, if
+// any, must have been stopped.
+func (e *e2e) launch(h hooks) {
+	t := e.t
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	ready := make(chan *daemon, 1)
 	done := make(chan error, 1)
@@ -68,7 +91,7 @@ func startE2E(t *testing.T, h hooks) *e2e {
 		}
 		ready <- d
 	}
-	go func() { done <- runWith(ctx, []string{"-config", cfg}, discard{}, e.errOut, h) }()
+	go func() { done <- runWith(ctx, []string{"-config", e.cfg}, discard{}, e.errOut, h) }()
 	select {
 	case e.d = <-ready:
 	case runErr := <-done:
@@ -84,17 +107,13 @@ func startE2E(t *testing.T, h hooks) *e2e {
 			}
 		})
 	}
+	stop := e.stop
 	t.Cleanup(func() {
-		e.stop()
+		stop()
 		if t.Failed() {
 			t.Logf("daemon log:\n%s", e.errOut.String())
 		}
 	})
-	if e.c, err = lab.NewClient(nil); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(e.c.CloseIdle)
-	return e
 }
 
 type discard struct{}

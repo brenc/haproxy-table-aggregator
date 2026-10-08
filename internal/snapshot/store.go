@@ -7,6 +7,7 @@ import (
 
 	"github.com/brenc/haproxy-table-aggregator/internal/peermsg"
 	"github.com/brenc/haproxy-table-aggregator/internal/peersession"
+	"github.com/brenc/haproxy-table-aggregator/internal/rate"
 	"github.com/brenc/haproxy-table-aggregator/internal/sources"
 )
 
@@ -31,11 +32,13 @@ type source struct {
 	synced   bool
 	partials int
 	lastRx   time.Time
+	upAt     time.Time // when the current session came up
 	fault    error
 	tables   map[string]*table
 	entries  int
+	loss     Loss
 
-	accepted, refused, stale, expired, decreases uint64
+	accepted, refused, stale, expired, decreases, released uint64
 }
 
 // table is one logical input table of one source.
@@ -103,7 +106,7 @@ func (s *Store) Apply(ev sources.Event) error {
 			return refuse(ErrSession, "source %s: session %d up after session %d", src.name, ev.Session, src.session)
 		}
 		src.session, src.up, src.synced, src.partials = ev.Session, true, false, 0
-		src.lastRx = up.At
+		src.lastRx, src.upAt = up.At, up.At
 		for _, t := range src.tables {
 			t.defined = false
 		}
@@ -148,6 +151,12 @@ func (s *Store) apply(src *source, body peersession.Event) error {
 			return refuse(ErrSchema, "source %s: %v", src.name, err)
 		}
 		t.def, t.defined, t.rejected = b.Definition, true, nil
+		if src.synced {
+			// Announced after the finished reply (stock HAProxy never
+			// does this): nothing will reconcile the table later, so its
+			// unconfirmed entries go now, as lost history if live.
+			s.release(src, s.now(), t)
+		}
 		return nil
 	case peersession.EntryUpdated:
 		src.touch(b.Update.Received)
@@ -163,6 +172,14 @@ func (s *Store) apply(src *source, body peersession.Event) error {
 		// belongs to an earlier session: this complete sync supersedes
 		// it.
 		src.synced, src.fault = true, nil
+		// The session has now taught every entry it holds of each table
+		// it announced: what an earlier session delivered and this one
+		// did not confirm no longer exists at the source.
+		for _, t := range src.tables {
+			if t.defined {
+				s.release(src, s.now(), t)
+			}
+		}
 		return nil
 	default:
 		return refuse(ErrSchema, "source %s: unknown event %T", src.name, body)
@@ -202,6 +219,12 @@ func (s *Store) update(src *source, ev peersession.EntryUpdated) error {
 		return nil
 	}
 	lowered := had && e.Count < old.Count
+	if lowered && old.Session < e.Session && e.Deadline.After(now) {
+		// Lower in a later session: the source recreated or reset the
+		// entry while no session was reporting it, so whatever the old
+		// value counted (its rate history included) is gone there.
+		s.noteLoss(src, t, old, now, true)
+	}
 	if had {
 		e.Decreases, e.LastDecrease = old.Decreases, old.LastDecrease
 		if lowered {
@@ -221,6 +244,13 @@ func (s *Store) update(src *source, ev peersession.EntryUpdated) error {
 	}
 	if !had && src.entries >= s.capacity {
 		s.expireSource(src, now)
+		if src.entries >= s.capacity {
+			// Make room from entries no session has confirmed since an
+			// earlier one delivered them; see the package documentation.
+			for _, rt := range src.tables {
+				s.release(src, now, rt)
+			}
+		}
 		if src.entries >= s.capacity {
 			return refuse(ErrCapacity, "source %s: %d entries", src.name, src.entries)
 		}
@@ -281,6 +311,78 @@ func entryFrom(u peermsg.Update, def peermsg.Definition) (Entry, error) {
 	}
 	e.Deadline = u.Received.Add(u.Lifetime(def.Expiry).Duration())
 	return e, nil
+}
+
+// release removes every entry of table t of src delivered by an earlier
+// session than its current one. An entry still unexpired beyond LossGrace
+// is recorded as lost history (noteLoss). Callers hold s.mu.
+func (s *Store) release(src *source, now time.Time, t *table) {
+	for k, e := range t.entries {
+		if e.Session >= src.session {
+			continue
+		}
+		delete(t.entries, k)
+		src.entries--
+		if !e.Deadline.After(now) {
+			src.expired++
+			continue
+		}
+		src.released++
+		s.noteLoss(src, t, e, now, false)
+	}
+}
+
+// noteLoss records that src no longer holds the history old (an entry of
+// table t) represents, unless old was due to expire within LossGrace
+// anyway: the source then expired it on its own clock. recreated
+// distinguishes a lower value in a later session from an entry absent
+// from it. The loss windows cover both the history old reported and
+// whatever the entry counted unreported before the current session came
+// up (see Recovery in the package documentation). Callers hold s.mu.
+func (s *Store) noteLoss(src *source, t *table, old Entry, now time.Time, recreated bool) {
+	if !old.Deadline.After(now.Add(LossGrace)) {
+		return
+	}
+	l := &src.loss
+	if recreated {
+		l.Recreated++
+	} else {
+		l.Absent++
+	}
+	l.Session, l.At = src.session, now
+	// Reported history: until the last report's estimate reaches 0 or
+	// its entry would have expired.
+	countUntil := old.Deadline
+	rateUntil := rate.Counter{Value: old.Rate, Period: old.Period, Received: old.Received}.ZeroAt()
+	if old.Deadline.Before(rateUntil) {
+		rateUntil = old.Deadline
+	}
+	// Unreported history: no session reported the entry from the end of
+	// old's session until the current one came up, so the source may
+	// have counted events up to then, each weighing in its native rate
+	// for at most two periods after it, in an entry living at most its
+	// table expiry beyond it.
+	life := old.Deadline.Sub(old.Received)
+	if t.def.Expiry > 0 {
+		life = t.def.Expiry.Duration()
+	}
+	if until := src.upAt.Add(life); until.After(countUntil) {
+		countUntil = until
+	}
+	// old.Period is at most MaxInt32 ms (config), so 2P+1 ms fits.
+	unreported := src.upAt.Add(time.Duration(2*int64(old.Period)+1) * time.Millisecond)
+	if life < unreported.Sub(src.upAt) {
+		unreported = src.upAt.Add(life)
+	}
+	if unreported.After(rateUntil) {
+		rateUntil = unreported
+	}
+	if countUntil.After(l.CountUntil) {
+		l.CountUntil = countUntil
+	}
+	if rateUntil.After(now) && rateUntil.After(l.RateUntil) {
+		l.RateUntil = rateUntil
+	}
 }
 
 func (src *source) touch(at time.Time) {
@@ -498,7 +600,7 @@ func (s *Store) report(src *source, now time.Time) SourceReport {
 		Name: src.name, Session: src.session, Up: src.up, Synced: src.synced, PartialReplies: src.partials,
 		Fault: src.fault, Entries: src.entries,
 		Accepted: src.accepted, Refused: src.refused, Stale: src.stale, Expired: src.expired,
-		Decreases: src.decreases,
+		Decreases: src.decreases, Released: src.released, Loss: src.loss,
 	}
 	if src.up {
 		rep.LastRx = src.lastRx
@@ -531,6 +633,11 @@ func (s *Store) report(src *source, now time.Time) SourceReport {
 		rep.State, rep.Reason = Syncing, "awaiting the resync reply"
 	case len(missing) > 0:
 		rep.State, rep.Reason = Degraded, fmt.Sprintf("synchronized without announcing input tables %v", missing)
+	case now.Before(src.loss.RateUntil):
+		rep.State = Degraded
+		rep.Reason = fmt.Sprintf("history lost: %d entries absent from and %d reset in a later session "+
+			"(last in session %d); rates complete again in %v", src.loss.Absent, src.loss.Recreated,
+			src.loss.Session, src.loss.RateUntil.Sub(now).Round(time.Millisecond))
 	default:
 		rep.State = Ready
 	}

@@ -35,8 +35,19 @@ import (
 // capped at that expiry, and a zero lifetime removes the value. The total
 // is the sum of the ready sources' unexpired values; it is complete when
 // every roster source is ready. A counted value is uncertain if an update
-// lowered it while its entry was live, or if an earlier session than the
-// source's current one delivered it.
+// lowered it while its entry was live, if an earlier session than the
+// source's current one delivered it, or while the source's lost history
+// could still be missing from counts.
+//
+// Recovery (phase 11): a finished resync drops every value an earlier
+// session delivered in each table the current session defined. A new key
+// arriving while the source holds Capacity or more unexpired values first
+// drops every earlier-session value in every table. A dropped value that
+// would have outlived the drop by more than Grace, and a value replaced
+// by a lower count from a later session, are lost history: the source is
+// not ready until each such value's reference rate reading would have
+// stayed 0 or the value would have expired, whichever is first, and its
+// counted values are uncertain until the latest such value's deadline.
 //
 // Refusals: a refused event of the current session faults the source
 // until a finished resync (a refused definition of a configured table
@@ -50,6 +61,12 @@ type Oracle struct {
 	Health time.Duration
 	// Tables are the configured input table names.
 	Tables []string
+	// Periods maps each table to its http_req_rate period in ms.
+	Periods map[string]uint32
+	// Capacity is the store's entry capacity per source; 0 means none.
+	Capacity int
+	// Grace is the store's loss grace (snapshot.LossGrace).
+	Grace time.Duration
 
 	mu    sync.Mutex
 	trace []record
@@ -108,6 +125,12 @@ type source struct {
 	lastRx  time.Time
 	defined map[string]bool
 	values  map[string]map[peermsg.Key]value
+	// rateUntil and countUntil bound the effect of lost history.
+	rateUntil, countUntil time.Time
+	// upAt is when the current session came up; expiry is each table's
+	// last accepted announced expiry, in any session.
+	upAt   time.Time
+	expiry map[string]peermsg.Millis
 }
 
 // RateExpectation is what the oracle expects of one key's aggregate
@@ -134,6 +157,12 @@ func (o *Oracle) Want(roster []string, table string, key peermsg.Key, now time.T
 			x.Complete = false
 			return
 		}
+		if now.Before(s.countUntil) {
+			x.Uncertain = true
+		}
+		if v.session == 0 {
+			return // ready, holding no value
+		}
 		x.Counted[name] = v.count
 		x.Sum += uint64(v.count)
 		x.Uncertain = x.Uncertain || v.lowered || v.session < s.session
@@ -153,6 +182,9 @@ func (o *Oracle) WantRate(roster []string, table string, key peermsg.Key, period
 			x.Complete = false
 			return
 		}
+		if v.session == 0 {
+			return
+		}
 		est := ratetest.ReadReceived(v.rate, period, v.received, now)
 		x.Counted[name] = est
 		x.Sum += est
@@ -165,7 +197,8 @@ func (o *Oracle) WantRate(roster []string, table string, key peermsg.Key, period
 
 // visit replays the trace and calls fn for every roster source, in roster
 // order: with ok false for a source that is not ready at now, else with
-// its unexpired value of table and key, if it holds one.
+// its unexpired value of table and key, or a zero value (session 0) if it
+// holds none.
 func (o *Oracle) visit(roster []string, table string, key peermsg.Key, now time.Time,
 	fn func(name string, s *source, v value, ok bool),
 ) {
@@ -179,12 +212,12 @@ func (o *Oracle) visit(roster []string, table string, key peermsg.Key, now time.
 	}
 	for _, r := range trace {
 		if s := srcs[r.ev.Source]; s != nil {
-			s.replay(r, o.Tables)
+			s.replay(r, o)
 		}
 	}
 	for _, name := range roster {
 		s := srcs[name]
-		ready := s.up && s.synced && !s.fault && now.Sub(s.lastRx) < o.Health
+		ready := s.up && s.synced && !s.fault && now.Sub(s.lastRx) < o.Health && !now.Before(s.rateUntil)
 		for _, t := range o.Tables {
 			ready = ready && s.defined[t]
 		}
@@ -194,6 +227,8 @@ func (o *Oracle) visit(roster []string, table string, key peermsg.Key, now time.
 		}
 		if v, ok := s.values[table][key]; ok && now.Before(v.deadline) {
 			fn(name, s, v, true)
+		} else {
+			fn(name, s, value{}, true)
 		}
 	}
 }
@@ -204,9 +239,8 @@ func (s *source) seen(at time.Time) {
 	}
 }
 
-// replay applies one trace record. tables are the configured input
-// table names.
-func (s *source) replay(r record, tables []string) {
+// replay applies one trace record.
+func (s *source) replay(r record, o *Oracle) {
 	current := s.up && s.session == r.ev.Session
 	if !r.observed.IsZero() {
 		if current {
@@ -215,18 +249,26 @@ func (s *source) replay(r record, tables []string) {
 		return
 	}
 	if r.refused {
-		s.refuse(r.ev.Body, current, tables)
+		s.refuse(r.ev.Body, current, o.Tables)
 		return
 	}
 	switch b := r.ev.Body.(type) {
 	case peersession.SessionUp:
-		s.session, s.up, s.synced, s.lastRx = r.ev.Session, true, false, b.At
+		s.session, s.up, s.synced, s.lastRx, s.upAt = r.ev.Session, true, false, b.At, b.At
 		s.defined = map[string]bool{}
 	case peersession.SessionDown:
 		s.up, s.synced = false, false
 	case peersession.TableDefined:
 		s.seen(b.Received)
 		s.defined[b.Definition.Name] = true
+		if s.expiry == nil {
+			s.expiry = map[string]peermsg.Millis{}
+		}
+		s.expiry[b.Definition.Name] = b.Definition.Expiry
+		if s.synced {
+			// Announced after "finished": reconciled at once.
+			s.drop(o, b.Received, func(t string) bool { return t == b.Definition.Name })
+		}
 	case peersession.TableRejected:
 		// A report, not a refusal: the session rejected the input table's
 		// definition and ends; the source is faulty until a finished
@@ -239,10 +281,11 @@ func (s *source) replay(r record, tables []string) {
 		s.synced = !b.Partial
 		if !b.Partial {
 			s.fault = false
+			s.drop(o, b.Received, func(t string) bool { return s.defined[t] })
 		}
 	case peersession.EntryUpdated:
 		s.seen(b.Update.Received)
-		s.update(r.ev.Session, b)
+		s.update(o, r.ev.Session, b)
 	}
 }
 
@@ -266,7 +309,81 @@ func (s *source) refuse(body peersession.Event, current bool, tables []string) {
 	}
 }
 
-func (s *source) update(session uint64, b peersession.EntryUpdated) {
+// drop removes every value of an earlier session than the current one at
+// at, from the tables in selects, recording unexpired ones as lost.
+func (s *source) drop(o *Oracle, at time.Time, in func(table string) bool) {
+	for table, vals := range s.values {
+		if !in(table) {
+			continue
+		}
+		for k, v := range vals {
+			if v.session < s.session {
+				delete(vals, k)
+				if at.Before(v.deadline) {
+					s.lose(o, table, v, at)
+				}
+			}
+		}
+	}
+}
+
+// lose records v of table as lost history detected at at.
+func (s *source) lose(o *Oracle, table string, v value, at time.Time) {
+	if !v.deadline.After(at.Add(o.Grace)) {
+		return
+	}
+	if v.deadline.After(s.countUntil) {
+		s.countUntil = v.deadline
+	}
+	// The first age from which the reference reading stays 0: one past
+	// the last non-zero age up to two periods (it is 0 beyond).
+	p := o.Periods[table]
+	age := uint64(v.rate.Age)
+	zeroAge := age
+	for a := 2*uint64(p) + 1; a > age; a-- {
+		if ratetest.Read(v.rate.Curr, v.rate.Prev, p, a-1) > 0 {
+			zeroAge = a
+			break
+		}
+	}
+	//nolint:gosec // G115: zeroAge - age <= 2p+1 < 2^33 ms.
+	zero := v.received.Add(time.Duration(zeroAge-age) * time.Millisecond)
+	if v.deadline.Before(zero) {
+		zero = v.deadline
+	}
+	// Events the source may have counted unreported, up to the moment
+	// the current session came up, each weigh for at most two periods,
+	// in an entry that lives at most the table expiry after it.
+	life := v.deadline.Sub(v.received)
+	if e := s.expiry[table]; e > 0 {
+		life = time.Duration(e) * time.Millisecond
+	}
+	gapEnd := s.upAt.Add(min(life, time.Duration(2*int64(p)+1)*time.Millisecond))
+	if gapEnd.After(zero) {
+		zero = gapEnd
+	}
+	if c := s.upAt.Add(life); c.After(s.countUntil) {
+		s.countUntil = c
+	}
+	if zero.After(at) && zero.After(s.rateUntil) {
+		s.rateUntil = zero
+	}
+}
+
+// live counts the values unexpired at at, across tables.
+func (s *source) live(at time.Time) int {
+	n := 0
+	for _, vals := range s.values {
+		for _, v := range vals {
+			if at.Before(v.deadline) {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+func (s *source) update(o *Oracle, session uint64, b peersession.EntryUpdated) {
 	u := b.Update
 	life := b.Expiry
 	if u.Timed && u.Remaining < life {
@@ -291,8 +408,15 @@ func (s *source) update(session uint64, b peersession.EntryUpdated) {
 		}
 	}
 	v := value{count: count, rate: rate, received: u.Received, deadline: u.Received.Add(time.Duration(life) * time.Millisecond), session: session}
-	if old, ok := s.values[b.Table][u.Key]; ok && u.Received.Before(old.deadline) {
+	old, had := s.values[b.Table][u.Key]
+	had = had && u.Received.Before(old.deadline)
+	if had {
 		v.lowered = old.lowered || count < old.count
+		if count < old.count && old.session < session {
+			s.lose(o, b.Table, old, u.Received)
+		}
+	} else if o.Capacity > 0 && s.live(u.Received) >= o.Capacity {
+		s.drop(o, u.Received, func(string) bool { return true })
 	}
 	s.values[b.Table][u.Key] = v
 }

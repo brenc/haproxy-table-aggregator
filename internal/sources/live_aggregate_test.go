@@ -21,6 +21,20 @@ import (
 	"github.com/brenc/haproxy-table-aggregator/internal/sources"
 )
 
+// liveOracle returns a trace oracle with cfg's health bound, input
+// tables, periods, and entry capacity.
+func liveOracle(cfg config.Config) *aggregatetest.Oracle {
+	o := &aggregatetest.Oracle{
+		Health: cfg.HealthTimeout, Capacity: cfg.MaxSourceEntries, Grace: snapshot.LossGrace,
+		Periods: map[string]uint32{},
+	}
+	for _, t := range cfg.Tables {
+		o.Tables = append(o.Tables, t.Name)
+		o.Periods[t.Name] = uint32(t.Period.Milliseconds())
+	}
+	return o
+}
+
 // liveTotals checks diagnostic totals of a live store against the trace
 // oracle and the known lab traffic.
 type liveTotals struct {
@@ -142,7 +156,7 @@ func TestLiveCounterTotals(t *testing.T) {
 	}
 	lt := &liveTotals{
 		t: t, l: l, store: store, roster: []string{"a", "b"},
-		oracle: &aggregatetest.Oracle{Health: cfg.HealthTimeout, Tables: []string{lab.LabTable}},
+		oracle: liveOracle(cfg),
 	}
 	apply := func(ev sources.Event) error {
 		err := store.Apply(ev)

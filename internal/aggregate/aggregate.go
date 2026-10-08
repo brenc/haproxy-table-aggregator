@@ -65,10 +65,21 @@
 // source Ready at the same instant the values were read. Membership is
 // the configured roster: a source that disconnects or degrades keeps the
 // total incomplete until it is Ready again or is removed from the
-// configuration; connected peers never redefine it. A Ready source's
-// entry delivered by an earlier session (not confirmed by the current
-// session's complete snapshot, see the phase 07 handoff) is counted but
-// marked HeldOver, and also makes the total Uncertain.
+// configuration; connected peers never redefine it.
+//
+// # Recovery
+//
+// A finished resync releases every entry of the source that its session
+// did not confirm (package snapshot, Recovery), so a Ready source holds
+// only entries of its current session: a HeldOver entry, from an earlier
+// session, is only ever seen on a source that is not Ready, and is never
+// counted. When the store detected that a source lost history it held (an
+// entry absent from or reset in a later session), the source stays
+// Degraded until the lost entries could no longer change a rate; after
+// that, its counts may still lack what the lost entries counted until
+// their deadlines, so its contributions are marked HistoryLost and every
+// total Uncertain until then (the lost keys are no longer known). Lost
+// history is never restored or estimated.
 package aggregate
 
 import (
@@ -110,9 +121,17 @@ type Contribution struct {
 	// Present and the source Ready.
 	Counted bool
 	// HeldOver reports a Present entry delivered by an earlier session
-	// than the source's current one: the current session's snapshot did
-	// not confirm it, so it may no longer exist at the source.
+	// than the source's current one: the current session's snapshot has
+	// not confirmed it (yet), so it may no longer exist at the source.
+	// Only a source that is not Ready can hold one, so it is never
+	// Counted (see Recovery in the package documentation).
 	HeldOver bool
+	// HistoryLost reports that the source lost history it held for some
+	// keys (snapshot.Loss) and that a lost entry would not have expired
+	// yet at the total's time: the source's count for this key, present
+	// or not, may lack what it counted. It is per source, not per key,
+	// and makes the total Uncertain while the source is Ready.
+	HistoryLost bool
 	// Decreases and LastDecrease are the entry's recorded decreases
 	// (snapshot.Entry.Decreases); Discontinuous is Decreases > 0.
 	Decreases     uint64
@@ -135,8 +154,9 @@ type Total struct {
 	// sources and is not a total of the roster.
 	Complete bool
 	// Uncertain reports that a counted contribution is Discontinuous or
-	// HeldOver: Sum is still the sum of the current values, but those
-	// values may not represent everything the entries counted.
+	// HeldOver, or that a Ready source's contribution is HistoryLost:
+	// Sum is still the sum of the current values, but those values may
+	// not represent everything the entries counted.
 	Uncertain bool
 	// Sources describes every configured source, in roster order,
 	// whether or not it contributed.
@@ -164,6 +184,7 @@ func sum(table string, key peermsg.Key, roster snapshot.Roster, entries []snapsh
 	t := Total{Table: table, Key: key, At: roster.At, Complete: roster.Ready}
 	for _, src := range roster.Sources {
 		c := Contribution{Source: src.Name, State: src.State, Reason: src.Reason}
+		c.HistoryLost = src.Loss.CountUntil.After(roster.At)
 		if e, ok := byName[src.Name]; ok {
 			c.Present, c.Count, c.Session = true, e.Count, e.Session
 			c.HeldOver = e.Session < src.Session
@@ -178,6 +199,10 @@ func sum(table string, key peermsg.Key, roster snapshot.Roster, entries []snapsh
 			if c.Discontinuous || c.HeldOver {
 				t.Uncertain = true
 			}
+		}
+		if c.HistoryLost && src.State == snapshot.Ready {
+			// Present or not: the lost entry may have been this key's.
+			t.Uncertain = true
 		}
 		t.Sources = append(t.Sources, c)
 	}

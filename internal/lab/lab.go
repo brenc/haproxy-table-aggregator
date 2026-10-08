@@ -73,6 +73,11 @@ type Options struct {
 	// does not have. Node.PeersAddr is then empty, so the aggregator
 	// cannot dial the nodes; they dial it.
 	Reloadable bool
+	// Restartable keeps every node's inherited listeners open, peers
+	// bind included, so that Node.Restart can start a fresh process on
+	// the same addresses after the old one is gone: a cold restart with
+	// empty stick tables. It is implied by Reloadable.
+	Restartable bool
 }
 
 // Aggregator describes the aggregator peer the lab nodes are configured
@@ -226,7 +231,8 @@ func Start(ctx context.Context, opts Options) (_ *Lab, err error) {
 		return nil, err
 	}
 	for _, name := range nodes {
-		n, startErr := l.startNode(ctx, record.HAProxyPath, name, opts.Aggregator, opts.Reloadable)
+		n, startErr := l.startNode(ctx, record.HAProxyPath, name, opts.Aggregator, opts.Reloadable,
+			opts.Reloadable || opts.Restartable)
 		if n != nil {
 			l.Nodes = append(l.Nodes, n)
 		}
@@ -325,7 +331,8 @@ func listenInherited(ctx context.Context, network, address string) (inheritedLis
 	return inheritedListener{addr: ln.Addr().String(), file: f}, nil
 }
 
-func (l *Lab) startNode(ctx context.Context, haproxy, name string, agg *Aggregator, reloadable bool) (*Node, error) {
+func (l *Lab) startNode(ctx context.Context, haproxy, name string, agg *Aggregator, reloadable, keep bool,
+) (*Node, error) {
 	n := &Node{
 		Name:       name,
 		Socket:     filepath.Join(l.Dir, name+".sock"),
@@ -343,7 +350,7 @@ func (l *Lab) startNode(ctx context.Context, haproxy, name string, agg *Aggregat
 
 	var files []*os.File
 	defer func() {
-		if reloadable {
+		if keep {
 			n.files = files
 			return
 		}
@@ -508,6 +515,42 @@ func (n *Node) Reload(ctx context.Context) error {
 	n.retired = append(n.retired, n.proc)
 	if err := n.start(ctx, n.haproxy, n.dir, n.files, os.O_APPEND, "-sf", strconv.Itoa(n.PID())); err != nil {
 		return fmt.Errorf("lab: reload node %s: %w", n.Name, err)
+	}
+	return nil
+}
+
+// Restart cold-restarts a node of a Restartable (or Reloadable) lab: it
+// stops the current process, with SIGKILL if kill is set (a crash) or
+// SIGTERM otherwise, waits for it to exit, and starts a new process on
+// the same configuration and listeners with no -sf, so nothing hands
+// its stick tables over: the new process starts empty. Connections
+// queued on the listeners meanwhile reach the new process. Restart
+// returns once the new process answers on the runtime socket.
+func (n *Node) Restart(ctx context.Context, kill bool) error {
+	if n.files == nil {
+		return fmt.Errorf("lab: node %s is not restartable", n.Name)
+	}
+	for _, p := range append(n.retired, n.proc) {
+		if p == nil {
+			continue
+		}
+		select {
+		case <-p.exited:
+			continue
+		default:
+		}
+		if kill {
+			if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				return fmt.Errorf("lab: kill node %s: %w", n.Name, err)
+			}
+			<-p.exited
+		} else if err := stopProcess(n.Name, p.cmd, p.exited); err != nil {
+			return err
+		}
+	}
+	n.retired = nil
+	if err := n.start(ctx, n.haproxy, n.dir, n.files, os.O_APPEND); err != nil {
+		return fmt.Errorf("lab: restart node %s: %w", n.Name, err)
 	}
 	return nil
 }

@@ -446,3 +446,34 @@ func TestAgeRange(t *testing.T) {
 		}
 	}
 }
+
+// TestZeroAt checks against the reference reading that a counter reads 0
+// from ZeroAt on and, unless it already did at Received, not 1 ms
+// before; for empty counters, long-idle ones, and the low-rate case.
+func TestZeroAt(t *testing.T) {
+	base := time.Unix(1000, 0)
+	for _, p := range []uint32{1, 7, 10000} {
+		for _, c := range []struct{ curr, prev uint32 }{{0, 0}, {1, 0}, {0, 1}, {0, 2}, {5, 9}} {
+			for _, age := range []uint32{0, 1, p - 1, p, 2 * p, 2*p + 1, 3 * p, math.MaxUint32} {
+				ctr := rate.Counter{
+					Value:  peermsg.FreqCounter{Age: peermsg.Millis(age), Curr: c.curr, Prev: c.prev},
+					Period: peermsg.Millis(p), Received: base,
+				}
+				z := ctr.ZeroAt()
+				if z.Before(base) {
+					t.Fatalf("P=%d %+v age %d: ZeroAt %v before Received", p, c, age, z)
+				}
+				for _, d := range []time.Duration{0, time.Millisecond, time.Duration(3*p) * time.Millisecond} {
+					if got := ratetest.ReadReceived(ctr.Value, p, base, z.Add(d)); got != 0 {
+						t.Fatalf("P=%d %+v age %d: reads %d at ZeroAt+%v", p, c, age, got, d)
+					}
+				}
+				if z.After(base) {
+					if got := ratetest.ReadReceived(ctr.Value, p, base, z.Add(-time.Millisecond)); got == 0 {
+						t.Fatalf("P=%d %+v age %d: already 0 1 ms before ZeroAt %v", p, c, age, z.Sub(base))
+					}
+				}
+			}
+		}
+	}
+}

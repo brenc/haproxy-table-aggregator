@@ -230,6 +230,11 @@ func TestOverlappingSnapshotAndLive(t *testing.T) {
 	h.wantState("a", snapshot.Syncing)
 	h.clock.Advance(10 * time.Millisecond)
 	h.must("a", 2, h.timed(501, k, 6, 29990)) // the retried teach
+	// Until the teach reaches it, k2 keeps session 1's value.
+	if e, ok := h.s.Lookup("a", inTable, k2); !ok || e.Count != 7 || e.Session != 1 {
+		t.Fatalf("earlier session's key during the teach: %+v %v", e, ok)
+	}
+	h.must("a", 2, h.timed(502, k2, 7, 28980))
 	h.finish("a", 2, false)
 	h.wantCount("a", k, 6)
 	h.wantState("a", snapshot.Ready)
@@ -253,10 +258,8 @@ func TestOverlappingSnapshotAndLive(t *testing.T) {
 	bad.Update.Values = bad.Update.Values[:1]
 	h.refused("a", 2, bad, snapshot.ErrSchema)
 	h.wantCount("a", k, 6)
-	// The key session 2 has not re-sent keeps session 1's value, marked
-	// as such, until it expires.
-	if e, ok := h.s.Lookup("a", inTable, k2); !ok || e.Count != 7 || e.Session != 1 {
-		t.Fatalf("earlier session's key: %+v %v", e, ok)
+	if e, ok := h.s.Lookup("a", inTable, k2); !ok || e.Count != 7 || e.Session != 2 {
+		t.Fatalf("re-taught key: %+v %v", e, ok)
 	}
 }
 

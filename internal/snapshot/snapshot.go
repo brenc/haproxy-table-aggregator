@@ -46,9 +46,10 @@
 //     on the wire, so no delta is ever inferred from absolute values.
 //   - Expired entries are invisible to every read at once and removed by
 //     Expire (or any roster report); no new input is needed.
-//   - Entries of a disconnected source are retained until they expire.
-//     Keys missing from a later session's snapshot are not reconciled
-//     here; each entry records the session that delivered it.
+//   - Entries of a disconnected or syncing source are retained until they
+//     expire or are reconciled (see Recovery); each entry records the
+//     session that delivered it. They are never counted as current
+//     (callers gate on the source state).
 //
 // # Source states
 //
@@ -76,6 +77,8 @@
 //     was not announced in the session: HAProxy announces every table it
 //     shares when it teaches, even an empty one, so the source does not
 //     share it.
+//   - Degraded while the source's detected lost history could still
+//     change a rate (Loss.RateUntil; see Recovery).
 //   - Ready otherwise.
 //
 // A finished resync commits completeness only after every event before it
@@ -84,6 +87,75 @@
 // a source that never connected is Disconnected. The roster is ready only
 // when every configured source is Ready; one source completing its sync
 // changes nothing for the others.
+//
+// # Recovery
+//
+// Nothing is kept across a restart of this process: an empty store asks
+// every source for a full snapshot (package sources requests a resync in
+// every session), and the roster is ready only once every source has
+// answered "finished". A teach is applied in place like live updates, so
+// a replay replaces each key's value, never adds to it, and a timed
+// update's remaining lifetime keeps an entry from outliving its source's
+// copy.
+//
+// Reconciliation: a finished resync means the source has taught every
+// entry it holds in each table it announced in the session (stock
+// HAProxy walks its whole update tree, where an entry stays until it is
+// freed), before or interleaved with live updates of the same session.
+// So when it arrives, every entry of those tables that an earlier session
+// delivered and the current one did not is released: it no longer exists
+// at the source. Entries of a table the session did not announce are kept
+// (the source is Degraded and nothing proves their absence). A table
+// announced only after the finished reply (stock HAProxy never does so)
+// is reconciled when announced, since nothing would reconcile it later. A
+// partial reply reconciles nothing. Once Ready, a source therefore holds only
+// entries of its current session. Replaced session state is bounded too:
+// one entry per source, table, and key, at most MaxSourceEntries per
+// source. A new key that finds the source at capacity first releases
+// every unconfirmed earlier-session entry of the source, in every table,
+// rather than refusing the key (a reconnecting source near the bound
+// with a changed key set would otherwise stay degraded until they
+// expired); those entries may yet be taught again, so their release is
+// conservatively recorded as lost history below.
+//
+// Lost history: a released entry that had not expired here (beyond
+// LossGrace), and an entry that a later session reports with a lower
+// count, mean the source discarded history it held when the earlier
+// session reported it: a cold restart, a failed reload handover, an
+// eviction or runtime clear, or (for a lower count) a reset or recreation.
+// The store records that (SourceReport.Loss) and keeps the source
+// Degraded while the lost history could still weigh in the source's
+// native rate (Loss.RateUntil), since until then the aggregate rate lacks
+// requests that the source counted; it does not call that history
+// recovered. That is the later of two bounds: when the entry's last
+// reported estimate would have reached 0 (or the entry expired), and,
+// because no session reported the entry between its session's end and
+// the current session's start, two rate periods (capped at the table
+// expiry) after the current session came up, the last moment the source
+// may have counted unreported events into it. Count totals miss the lost
+// counts until the later of the entry's deadline and the table expiry
+// after that moment (Loss.CountUntil).
+//
+// Detection limits: the wire carries no source epoch, and a process ID
+// change is not evidence either way, so only these comparisons with what
+// this process still holds are possible. Undetectable: anything lost
+// while this process held no entry for the key (after its own restart,
+// or once the entry expired here); a key recreated at the source at or
+// above its earlier count with a fresh rate counter; and a source that
+// restarts empty while no key was live. A 32-bit counter wrap between
+// sessions, and an operator's runtime reset, are indistinguishable from a
+// loss and are reported as one. An entry evicted at the source during a
+// session (LRU eviction at a full table, or a runtime clear) is not
+// reported by the wire at all. If the key sees no further traffic, the
+// entry stays counted here until its local deadline (an overstatement,
+// which only adds denials) and is reported lost at the next finished
+// resync. If traffic recreates the key in the same session, the
+// recreated entry's update replaces the retained one: a lower count is
+// recorded only as a decrease (Entry.Decreases), its lost history,
+// rate included, is dropped without degrading the source, and the
+// aggregate understates until that history would have decayed. Within a
+// session that is indistinguishable from a reset or a 32-bit wrap; phase
+// 14 owns source-side eviction and recreation.
 package snapshot
 
 import (
@@ -93,6 +165,13 @@ import (
 	"github.com/brenc/haproxy-table-aggregator/internal/config"
 	"github.com/brenc/haproxy-table-aggregator/internal/peermsg"
 )
+
+// LossGrace is how close to its local deadline an entry may be released
+// without counting as lost history: the source expires it on its own
+// clock, which runs ahead of the local deadline by the update's transport
+// delay, so an entry that is about to expire here may already be gone
+// there.
+const LossGrace = time.Second
 
 // Errors returned by Apply and New. Apply's errors also wrap ErrRefused.
 var (
@@ -293,8 +372,36 @@ type SourceReport struct {
 	// events refused, updates ignored as older than the stored value,
 	// and entries removed by expiry (including updates that arrived
 	// expired). Decreases counts accepted updates that lowered a stored
-	// Count (see Entry.Decreases).
-	Accepted, Refused, Stale, Expired, Decreases uint64
+	// Count (see Entry.Decreases). Released counts unexpired entries of
+	// an earlier session released by reconciliation or to make room
+	// (see Recovery in the package documentation).
+	Accepted, Refused, Stale, Expired, Decreases, Released uint64
+	// Loss describes the source's detected lost history, if any.
+	Loss Loss
+}
+
+// Loss is a source's detected lost history (see Recovery in the package
+// documentation). Its counters accumulate over the store's lifetime; its
+// times are local monotonic times.
+type Loss struct {
+	// Absent counts entries a later session's snapshot did not confirm
+	// although they had not expired here (beyond LossGrace), including
+	// those released at capacity.
+	Absent uint64
+	// Recreated counts entries a later session reported with a lower
+	// count than the earlier session's.
+	Recreated uint64
+	// Session and At are the session and time of the last detection.
+	Session uint64
+	At      time.Time
+	// RateUntil is the latest time any lost history, reported or not,
+	// could still weigh in the source's native rate (see Recovery in the
+	// package documentation); the source is Degraded until then.
+	RateUntil time.Time
+	// CountUntil is the latest time a lost entry could still have been
+	// live at the source: until then diagnostic count totals may miss
+	// counts the source lost.
+	CountUntil time.Time
 }
 
 // Roster reports every source at one moment.

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/brenc/haproxy-table-aggregator/internal/aggregate"
 	"github.com/brenc/haproxy-table-aggregator/internal/output"
 	"github.com/brenc/haproxy-table-aggregator/internal/peermsg"
 	"github.com/brenc/haproxy-table-aggregator/internal/peersession"
@@ -179,14 +180,77 @@ func TestReadinessGatesPublication(t *testing.T) {
 	// b's next session: every key is reevaluated and leased again.
 	h.apply("b", 2, peersession.SessionUp{Direction: peersession.Inbound, At: h.clock.Now()})
 	h.apply("b", 2, peersession.TableDefined{ID: 1, Definition: h.def(), Received: h.clock.Now()})
+	h.pub.Pass()
+	if v, _ := h.published(k); v != 13 || h.out.Lease().Valid {
+		t.Fatalf("published %d, lease %+v while b syncs", v, h.out.Lease())
+	}
+	// b's teach re-sends its entry, which the finished resync confirms.
+	h.apply("b", 2, peersession.EntryUpdated{ID: 1, Table: inTable, Expiry: 3 * period, Update: peermsg.Update{
+		ID: 1, Key: k, Received: h.clock.Now(), Timed: true, Remaining: 3*period - 1000,
+		Values: []peermsg.Value{
+			{Type: peermsg.DataHTTPReqCnt, Uint: 7},
+			{Type: peermsg.DataHTTPReqRate, Freq: peermsg.FreqCounter{Curr: 7}},
+		},
+	}})
 	h.apply("b", 2, peersession.SyncFinished{Received: h.clock.Now()})
 	h.pub.Pass()
-	// b's entry from session 1 is held over: counted and uncertain.
 	if v, _ := h.published(k); v != 57 || !h.out.Lease().Valid {
 		t.Fatalf("published %d, lease %+v; want 57 leased", v, h.out.Lease())
 	}
-	if st := h.pub.Stats(); st.Uncertain != 1 || st.Published != 1 {
+	if st := h.pub.Stats(); st.Uncertain != 0 || st.Published != 1 {
 		t.Fatalf("stats %+v", st)
+	}
+}
+
+// TestLostHistoryRevokes checks that a source whose next session's
+// snapshot lacks an entry it held (as after a cold restart) keeps the
+// lease revoked, publishing nothing new, until the lost entry's rate
+// would have decayed to 0, and that every key is then reevaluated and
+// leased again without the lost contribution.
+func TestLostHistoryRevokes(t *testing.T) {
+	h := newHarness(t, publish.Options{})
+	k := key(t, "2001:db8:1::")
+	h.sync("a")
+	h.sync("b")
+	h.counter("a", k, 6, 0)
+	h.counter("b", k, 7, 0)
+	h.pub.Pass()
+	if v, _ := h.published(k); v != 13 || !h.out.Lease().Valid {
+		t.Fatalf("published %d, lease %+v", v, h.out.Lease())
+	}
+	h.apply("b", 1, peersession.SessionDown{At: h.clock.Now()})
+	h.clock.Advance(time.Second)
+	now := h.clock.Now()
+	h.apply("b", 2, peersession.SessionUp{Direction: peersession.Inbound, At: now})
+	h.apply("b", 2, peersession.TableDefined{ID: 1, Definition: h.def(), Received: now})
+	h.apply("b", 2, peersession.SyncFinished{Received: now})
+	rep, _ := h.snap.Source("b")
+	if rep.State != snapshot.Degraded || rep.Loss.Absent != 1 {
+		t.Fatalf("b after an empty snapshot: %+v", rep)
+	}
+	until := rep.Loss.RateUntil
+	beat := func() {
+		h.snap.Observe("a", 1, h.clock.Now())
+		h.snap.Observe("b", 2, h.clock.Now())
+	}
+	for h.clock.Now().Add(4 * time.Second).Before(until) {
+		h.clock.Advance(4 * time.Second)
+		beat()
+		h.pub.Pass()
+		if h.out.Lease().Valid {
+			t.Fatalf("leased %v before the lost history decayed", until.Sub(h.clock.Now()))
+		}
+	}
+	h.clock.Advance(until.Sub(h.clock.Now()))
+	beat()
+	h.pub.Pass()
+	// a's estimate alone, evaluated now; b's lost 7 is not restored.
+	r, err := aggregate.Rate(h.snap, inTable, k)
+	if err != nil || !r.Complete {
+		t.Fatalf("rate %+v, %v", r, err)
+	}
+	if v, _ := h.published(k); uint64(v) != r.Sum || !h.out.Lease().Valid {
+		t.Fatalf("published %d, lease %+v; want %d leased", v, h.out.Lease(), r.Sum)
 	}
 }
 
